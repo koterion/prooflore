@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { link, lstat, mkdir, open, readFile, readdir, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { copyFile, link, lstat, mkdir, open, readFile, readdir, unlink } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 
 import {
@@ -11,11 +12,13 @@ import {
   type RecordMemoryInput,
   type ReviewRecord,
   type ReviewVerdict,
+  type RuleClassification,
   type StoredRecord,
 } from './types.js';
 import {
   assertNoSecrets,
   objectValue,
+  parseRuleClassification,
   parseRecordInput,
   recordIdValue,
   stringArray,
@@ -68,23 +71,30 @@ async function atomicFileCreate(path: string, content: string): Promise<boolean>
     await handle.close();
     try {
       await link(temporary, path);
-      try {
-        const directory = await open(resolve(path, '..'), 'r');
-        try {
-          await directory.sync();
-        } finally {
-          await directory.close();
-        }
-      } catch (error) {
-        if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-          throw error;
-        }
-      }
-      return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw error;
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (code === 'EEXIST') return false;
+      if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes(code)) throw error;
+      try {
+        await copyFile(temporary, path, constants.COPYFILE_EXCL);
+      } catch (copyError) {
+        if ((copyError as NodeJS.ErrnoException).code === 'EEXIST') return false;
+        throw copyError;
+      }
     }
+    try {
+      const directory = await open(resolve(path, '..'), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+        throw error;
+      }
+    }
+    return true;
   } finally {
     await handle.close().catch(() => undefined);
     await unlink(temporary).catch(() => undefined);
@@ -123,10 +133,14 @@ function parseStoredRecord(value: unknown): StoredRecord {
           .map((parentId, index) => recordIdValue(parentId, `stored previousReviewIds[${index}]`)),
       verdict: stringValue(record.verdict, 'stored verdict', 16) as ReviewVerdict,
       reason: stringValue(record.reason, 'stored review reason', 2000),
+      classification: record.classification === undefined
+        ? undefined : parseRuleClassification(record.classification, 'stored classification'),
       actor: { ...actor, kind: 'human' },
       createdAt,
     };
-    if (!['approved', 'rejected', 'superseded'].includes(review.verdict)) throw new Error('Invalid stored verdict');
+    if (!['approved', 'rejected', 'revoked', 'superseded'].includes(review.verdict)) {
+      throw new Error('Invalid stored verdict');
+    }
     if (digest(reviewContent(review)) !== id) throw new Error('Stored review digest mismatch');
     return review;
   }
@@ -178,8 +192,30 @@ function reviewContent(record: Omit<ReviewRecord, 'schemaVersion' | 'id' | 'crea
     previousReviewIds: record.previousReviewIds,
     verdict: record.verdict,
     reason: record.reason,
+    classification: record.classification,
     actor: record.actor,
   };
+}
+
+function invalidReviewRelations(records: StoredRecord[]): Set<string> {
+  const byId = new Map(records.map((record) => [record.id, record]));
+  const invalid = new Set<string>();
+  for (const review of records.filter((record): record is ReviewRecord => record.kind === 'review')) {
+    const target = byId.get(review.targetId);
+    if (!target || target.kind !== 'rule_candidate') {
+      invalid.add(review.id);
+      continue;
+    }
+    const parentIds = [
+      ...(review.previousReviewId ? [review.previousReviewId] : []),
+      ...(review.previousReviewIds ?? []),
+    ];
+    if (parentIds.some((parentId) => {
+      const parent = byId.get(parentId);
+      return !parent || parent.kind !== 'review' || parent.targetId !== review.targetId;
+    })) invalid.add(review.id);
+  }
+  return invalid;
 }
 
 /** Stores immutable, merge-friendly project knowledge with human-controlled rule promotion. */
@@ -187,6 +223,7 @@ export class ProjectMemoryStore {
   readonly root: string;
   readonly directory: string;
   readonly recordsDirectory: string;
+  private readonly recordCache = new Map<string, { signature: string; record: StoredRecord }>();
 
   constructor(root: string) {
     this.root = resolve(root);
@@ -310,6 +347,7 @@ export class ProjectMemoryStore {
     verdict: ReviewVerdict,
     reason: string,
     developerId: string,
+    classification?: RuleClassification,
   ): Promise<{ review: ReviewRecord; created: boolean }> {
     const target = await this.readRecord(targetId);
     if (target.kind !== 'rule_candidate') throw new Error('Only rule candidates can be reviewed');
@@ -327,7 +365,13 @@ export class ProjectMemoryStore {
     assertNoSecrets(actor.developerId, 'developerId');
     const validatedReason = stringValue(reason, 'reason', 2000);
     assertNoSecrets(validatedReason, 'reason');
-    if (!['approved', 'rejected', 'superseded'].includes(verdict)) throw new Error('Invalid review verdict');
+    if (!['approved', 'rejected', 'revoked', 'superseded'].includes(verdict)) {
+      throw new Error('Invalid review verdict');
+    }
+    const latestReview = reviewState.latest.get(targetId);
+    if (verdict === 'revoked' && latestReview?.verdict !== 'approved') {
+      throw new Error('Only an approved rule can be revoked');
+    }
     const content: Omit<ReviewRecord, 'schemaVersion' | 'id' | 'createdAt'> = {
       projectId: target.projectId,
       kind: 'review' as const,
@@ -336,6 +380,8 @@ export class ProjectMemoryStore {
         ? [reviewState.latest.get(targetId)!.id] : undefined),
       verdict,
       reason: validatedReason,
+      classification: classification === undefined
+        ? latestReview?.classification : parseRuleClassification(classification),
       actor,
     };
     const id = digest(reviewContent(content));
@@ -369,9 +415,14 @@ export class ProjectMemoryStore {
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_RECORD_BYTES) {
       throw new Error(`Invalid record file: ${id}`);
     }
+    const signature = [metadata.dev, metadata.ino, metadata.mode, metadata.size, metadata.mtimeMs, metadata.ctimeMs]
+      .join(':');
+    const cached = this.recordCache.get(id);
+    if (cached?.signature === signature) return structuredClone(cached.record);
     const record = parseStoredRecord(JSON.parse(await readFile(path, 'utf8')));
     if (record.id !== id) throw new Error(`Record content id mismatch: ${id}`);
-    return record;
+    this.recordCache.set(id, { signature, record: structuredClone(record) });
+    return structuredClone(record);
   }
 
   /** Reads a content-addressed record by stable identifier within this exact project. */
@@ -379,6 +430,20 @@ export class ProjectMemoryStore {
     const config = await this.readConfig();
     const record = await this.readRecordUnchecked(id);
     if (record.projectId !== config.projectId) throw new Error(`Foreign project record: ${id}`);
+    if (record.kind === 'review') {
+      const target = await this.readRecordUnchecked(record.targetId).catch(() => undefined);
+      if (!target || target.projectId !== config.projectId || target.kind !== 'rule_candidate') {
+        throw new Error(`Invalid review target: ${record.id}`);
+      }
+      for (const parentId of [
+        ...(record.previousReviewId ? [record.previousReviewId] : []),
+        ...(record.previousReviewIds ?? []),
+      ]) {
+        const parent = await this.readRecordUnchecked(parentId).catch(() => undefined);
+        if (!parent || parent.projectId !== config.projectId || parent.kind !== 'review'
+          || parent.targetId !== record.targetId) throw new Error(`Invalid review parent: ${record.id}`);
+      }
+    }
     return record;
   }
 
@@ -389,6 +454,8 @@ export class ProjectMemoryStore {
     if (names.length > MAX_RECORDS) throw new Error(`Record limit exceeded: ${names.length}`);
     const invalidName = names.find((name) => !/^[a-f0-9]{64}\.json$/u.test(name));
     if (invalidName) throw new Error(`Invalid record file: ${invalidName}`);
+    const currentIds = new Set(names.map((name) => name.slice(0, -5)));
+    for (const id of this.recordCache.keys()) if (!currentIds.has(id)) this.recordCache.delete(id);
     const records: StoredRecord[] = [];
     for (let index = 0; index < names.length; index += 32) {
       const batch = await Promise.all(names.slice(index, index + 32)
@@ -397,7 +464,20 @@ export class ProjectMemoryStore {
       if (foreign) throw new Error(`Foreign project record: ${foreign.id}`);
       records.push(...batch);
     }
+    const invalidRelations = invalidReviewRelations(records);
+    if (invalidRelations.size > 0) {
+      throw new Error(`Invalid review relation: ${[...invalidRelations].sort()[0]}`);
+    }
     return records;
+  }
+
+  /** Returns the immutable human review history for one rule in chronological order. */
+  async ruleHistory(targetId: string): Promise<ReviewRecord[]> {
+    const target = await this.readRecord(targetId);
+    if (target.kind !== 'rule_candidate') throw new Error('Only rule candidates have review history');
+    return (await this.listRecords())
+      .filter((record): record is ReviewRecord => record.kind === 'review' && record.targetId === targetId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
   }
 
   /** Computes a health summary without silently treating corrupted records as valid context. */
@@ -416,8 +496,11 @@ export class ProjectMemoryStore {
         corruptedRecords.push(name);
       }
     }
-    const memory = records.filter((record): record is MemoryRecord => record.kind !== 'review');
-    const reviews = records.filter((record): record is ReviewRecord => record.kind === 'review');
+    const invalidRelations = invalidReviewRelations(records);
+    for (const id of invalidRelations) corruptedRecords.push(`${id}.json`);
+    const trustedRecords = records.filter((record) => !invalidRelations.has(record.id));
+    const memory = trustedRecords.filter((record): record is MemoryRecord => record.kind !== 'review');
+    const reviews = trustedRecords.filter((record): record is ReviewRecord => record.kind === 'review');
     const reviewState = resolveReviewStates(reviews);
     const latest = reviewState.latest;
     const contributors = new Map<string, {
@@ -426,7 +509,7 @@ export class ProjectMemoryStore {
       agentRecords: number;
       providers: Set<string>;
     }>();
-    for (const record of records) {
+    for (const record of trustedRecords) {
       const contributor = contributors.get(record.actor.developerId) ?? {
         developerId: record.actor.developerId,
         humanRecords: 0,
@@ -444,12 +527,13 @@ export class ProjectMemoryStore {
       candidates: memory.filter((record) => record.kind === 'rule_candidate').length,
       approvedRules: [...latest.values()].filter((review) => review.verdict === 'approved').length,
       rejectedRules: [...latest.values()].filter((review) => review.verdict === 'rejected').length,
+      revokedRules: [...latest.values()].filter((review) => review.verdict === 'revoked').length,
       reviewConflicts: reviewState.conflicts.size,
-      storeDigest: digest(records.map((record) => record.id).sort()),
+      storeDigest: digest(trustedRecords.map((record) => record.id).sort()),
       contributors: [...contributors.values()]
         .sort((left, right) => left.developerId.localeCompare(right.developerId))
         .map((contributor) => ({ ...contributor, providers: [...contributor.providers].sort() })),
-      corruptedRecords,
+      corruptedRecords: [...new Set(corruptedRecords)].sort(),
     };
   }
 }

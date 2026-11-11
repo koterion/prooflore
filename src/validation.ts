@@ -1,6 +1,12 @@
 import { posix } from 'node:path';
 
-import { MEMORY_KINDS, type MemoryEvidence, type MemoryKind, type RecordMemoryInput } from './types.js';
+import {
+  MEMORY_KINDS,
+  type MemoryEvidence,
+  type MemoryKind,
+  type RecordMemoryInput,
+  type RuleClassification,
+} from './types.js';
 
 const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
@@ -13,6 +19,24 @@ const SECRET_PATTERNS = [
 ];
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
 const RECORD_ID = /^[a-f0-9]{64}$/u;
+export const KNOWN_RULE_LANGUAGES = [
+  'c', 'cpp', 'csharp', 'css', 'go', 'html', 'java', 'javascript', 'kotlin', 'php',
+  'python', 'ruby', 'rust', 'scss', 'swift', 'typescript', 'vue',
+] as const;
+export const KNOWN_RULE_TEST_TYPES = [
+  'automated', 'contract', 'e2e', 'integration', 'performance', 'security', 'unit', 'visual',
+] as const;
+const CLASSIFICATION_ALIASES: Readonly<Record<'languages' | 'testTypes', Readonly<Record<string, string>>>> = {
+  languages: {
+    js: 'javascript', jsx: 'javascript', node: 'javascript', nodejs: 'javascript',
+    ts: 'typescript', tsx: 'typescript', py: 'python', rs: 'rust', golang: 'go',
+    'c#': 'csharp', 'c++': 'cpp',
+  },
+  testTypes: {
+    'unit-test': 'unit', 'integration-test': 'integration', 'contract-test': 'contract',
+    'end-to-end': 'e2e', snapshot: 'visual', benchmark: 'performance', perf: 'performance',
+  },
+};
 
 /** Narrows an unknown value to a plain object. */
 export function objectValue(value: unknown, name: string): Record<string, unknown> {
@@ -60,6 +84,29 @@ export function recordIdValue(value: unknown, name: string): string {
   const id = stringValue(value, name, 64);
   if (!RECORD_ID.test(id)) throw new Error(`${name} must be a SHA-256 record ID`);
   return id;
+}
+
+/** Canonicalizes one classification facet while preserving open-ended project areas. */
+export function normalizeRuleFacet(key: keyof RuleClassification, value: string): string {
+  const normalized = value.trim().toLocaleLowerCase().replace(/[\s_]+/gu, '-');
+  if (key === 'areas') return normalized;
+  return CLASSIFICATION_ALIASES[key][normalized] ?? normalized;
+}
+
+/** Validates normalized human-confirmed rule applicability facets. */
+export function parseRuleClassification(value: unknown, name = 'classification'): RuleClassification {
+  const input = objectValue(value, name);
+  const unexpected = Object.keys(input).filter((key) => !['areas', 'languages', 'testTypes'].includes(key));
+  if (unexpected.length > 0) throw new Error(`${name} contains unsupported fields: ${unexpected.join(', ')}`);
+  const facet = (key: keyof RuleClassification): string[] => stringArray(input[key], `${name}.${key}`, 20, 64)
+    .map((item) => normalizeRuleFacet(key, item))
+    .map((item) => {
+      if (item === 'global') throw new Error(`${name}.${key} must use an empty list for global applicability`);
+      if (!/^[a-z0-9][a-z0-9.-]*$/u.test(item)) throw new Error(`${name}.${key} contains an invalid facet`);
+      return item;
+    })
+    .sort();
+  return { areas: facet('areas'), languages: facet('languages'), testTypes: facet('testTypes') };
 }
 
 /** Parses untrusted MCP or CLI input into the portable memory contract. */

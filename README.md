@@ -91,24 +91,81 @@ preserved. Setup never changes global agent settings, permissions or approval po
 4. Record durable decisions, corrections, outcomes and exemplars after verification.
 5. Propose reusable rules for human review.
 
-An agent cannot approve its own rule. Supported clients can present a review form in
-chat; the CLI is available as a fallback:
+`project_memory_context` classifies the task from its description and affected paths.
+It automatically selects approved rules whose area, language and test type are
+compatible, prioritizes exact matches and excludes conflicting classified rules.
+Global approved rules without classification remain applicable. The response includes
+`classification` and `ruleMatches` so the selection is inspectable.
+
+An agent proposes both the rule and its classification, but the human reviewer has
+final authority over both. Supported clients show the calculated area, language and
+test type in the review form and allow the reviewer to correct them before approval.
+The confirmed classification is stored in the immutable review and overrides the
+agent proposal. The CLI is available as a fallback:
 
 ```sh
 npx prooflore candidates --limit 20
 npx prooflore review RECORD_ID approved \
   --reason "Confirmed in code review" \
+  --developer REVIEWER_ID \
+  --area accordion \
+  --language typescript \
+  --test-type unit
+```
+
+Use a comma-separated value for multiple categories, or `global` to clear a facet.
+Omitted classification options retain the calculated values shown for review.
+
+Approved rules can be revoked without deleting their history:
+
+```sh
+npx prooflore review RECORD_ID revoked \
+  --reason "No longer valid after the API migration" \
   --developer REVIEWER_ID
 ```
+
+The original rule and every review remain immutable, including the reviewer, reason
+and timestamp. A human can restore the same rule later by reviewing it as `approved`
+again. Use `npx prooflore history RECORD_ID` to inspect the complete audit trail.
+
+Classify proposed rules with namespaced tags so the catalog remains predictable:
+
+```text
+area:accordion
+language:typescript
+test:unit
+rule-key:accordion-rendering
+```
+
+`area:`/`domain:`, `language:`/`lang:` and `test:`/`test-type:` are supported.
+Common language and test aliases such as `js`, `ts`, `py`, `unit-test` and
+`end-to-end` are canonicalized. `doctor` reports suspicious unknown taxonomy and
+ambiguous `rule-key:` tags without rewriting immutable records.
+For older rules without these tags, ProofLore derives compatible fallback categories
+only from `scope`. Evidence paths prove a rule but never restrict where it applies,
+so a rule without classification tags or scope remains global. Browse the catalog with:
+
+```sh
+npx prooflore rules
+npx prooflore rules --area accordion --language typescript --test-type unit
+```
+
+Use one stable `rule-key:` for mutually exclusive versions of a policy. A pending
+replacement never disables the approved rule. After human approval, the replacement
+must list every prior version in `supersedes`; unresolved approved rules with the same
+key are excluded fail-closed and visible through `explain-context`.
 
 ## MCP tools
 
 | Tool | Purpose |
 | --- | --- |
 | `project_memory_context` | Retrieve bounded context for a task and affected paths |
+| `project_memory_explain_context` | Explain why rules were selected or excluded |
 | `project_memory_get` | Read an immutable record by ID |
 | `project_memory_status` | Check store integrity, contributors and setup state |
 | `project_memory_candidates` | List rules awaiting human review |
+| `project_memory_rules` | Browse rules sorted by area, language and test type |
+| `project_memory_rule_history` | Read a rule's complete human review history |
 | `project_memory_record` | Save a verified observation |
 | `project_memory_propose_rule` | Propose a reusable rule |
 | `project_memory_review_rule` | Request a human-controlled review form |
@@ -164,7 +221,10 @@ than replacing the existing command.
 | `prooflore init --project ID` | Initialize only the memory store |
 | `prooflore doctor` | Verify records, reviews and managed setup |
 | `prooflore context TASK --path PATH` | Retrieve bounded local context |
+| `prooflore explain-context TASK --path PATH` | Explain rule selection and exclusions |
 | `prooflore candidates` | List rule candidates |
+| `prooflore rules` | Browse and filter the classified rule catalog |
+| `prooflore history ID` | Show approval, revocation and restoration history |
 | `prooflore record --file INPUT.json` | Append a validated record |
 | `prooflore review ID VERDICT ...` | Record a human review |
 | `prooflore mcp` | Start the stdio MCP server |
@@ -176,6 +236,8 @@ than replacing the existing command.
 - Likely credentials and private keys are rejected before storage.
 - Paths must remain inside the current project.
 - Stored records are revalidated and their content hashes are checked on read.
+- Invalid, ambiguous or oversized rule classifications are rejected before storage.
+- Reviews with missing targets, invalid parents or modified classifications fail closed.
 - Corrupted, tampered or foreign-project records fail closed.
 - Agents cannot supply human rule-review verdicts.
 - The package does not execute project code or modify global provider configuration.

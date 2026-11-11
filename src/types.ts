@@ -10,7 +10,7 @@ export const MEMORY_KINDS = [
 ] as const;
 
 export type MemoryKind = typeof MEMORY_KINDS[number];
-export type ReviewVerdict = 'approved' | 'rejected' | 'superseded';
+export type ReviewVerdict = 'approved' | 'rejected' | 'revoked' | 'superseded';
 
 export type ProjectMemoryConfig = {
   schemaVersion: typeof PROJECT_MEMORY_SCHEMA_VERSION;
@@ -58,6 +58,7 @@ export type ReviewRecord = {
   previousReviewIds?: string[];
   verdict: ReviewVerdict;
   reason: string;
+  classification?: RuleClassification;
   actor: MemoryActor & { kind: 'human' };
   createdAt: string;
 };
@@ -81,9 +82,31 @@ export type RecordMemoryInput = {
 export type MemoryContext = {
   projectId: string;
   query: string;
+  classification: RuleClassification;
   approvedRules: MemoryRecord[];
+  ruleMatches: Array<{
+    recordId: string;
+    areas: string[];
+    languages: string[];
+    testTypes: string[];
+  }>;
   relevantHistory: MemoryRecord[];
   conflicts: Array<{ recordId: string; reason: string }>;
+  truncated: boolean;
+};
+
+export type RuleSelectionDecision = {
+  recordId: string;
+  summary: string;
+  state: RuleCandidateState;
+  classification: RuleClassification;
+  outcome: 'selected' | 'excluded';
+  reason: string;
+};
+
+export type MemoryContextExplanation = {
+  context: MemoryContext;
+  decisions: RuleSelectionDecision[];
   truncated: boolean;
 };
 
@@ -93,6 +116,7 @@ export type MemoryStatus = {
   candidates: number;
   approvedRules: number;
   rejectedRules: number;
+  revokedRules: number;
   reviewConflicts: number;
   storeDigest: string;
   contributors: Array<{
@@ -106,6 +130,12 @@ export type MemoryStatus = {
 
 export type RuleCandidateState = 'pending' | ReviewVerdict | 'conflict';
 
+export type RuleClassification = {
+  areas: string[];
+  languages: string[];
+  testTypes: string[];
+};
+
 export type RuleCandidateSummary = {
   id: string;
   summary: string;
@@ -115,9 +145,28 @@ export type RuleCandidateSummary = {
   createdAt: string;
   state: RuleCandidateState;
   latestReviewId?: string;
+  latestReview?: {
+    verdict: ReviewVerdict;
+    reason: string;
+    reviewedBy: string;
+    createdAt: string;
+  };
+  classification: RuleClassification;
 };
 
 export type RuleCandidatePage = {
   items: RuleCandidateSummary[];
   nextCursor?: string;
+};
+
+export type RuleCatalogFilters = {
+  state?: RuleCandidateState;
+  area?: string;
+  language?: string;
+  testType?: string;
+};
+
+export type RuleCatalogPage = RuleCandidatePage & {
+  total: number;
+  filters: RuleCatalogFilters;
 };

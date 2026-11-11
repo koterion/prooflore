@@ -12,13 +12,31 @@ import {
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { buildMemoryContext, listRuleCandidates } from './context.js';
+import {
+  buildMemoryContext,
+  classifyRule,
+  explainMemoryContext,
+  inspectRuleTaxonomy,
+  listRuleCandidates,
+  listRules,
+} from './context.js';
 import { inspectProjectMemoryIntegration, projectMemoryPackageVersion } from './setup.js';
-import { ProjectMemoryStore } from './store.js';
-import type { MemoryRecord, ReviewVerdict } from './types.js';
-import { parseRecordInput, relativeProjectPath, stringArray, stringValue } from './validation.js';
+import { ProjectMemoryStore, resolveReviewStates } from './store.js';
+import type {
+  MemoryRecord,
+  ReviewVerdict,
+  RuleCandidateState,
+  RuleClassification,
+} from './types.js';
+import {
+  parseRecordInput,
+  parseRuleClassification,
+  relativeProjectPath,
+  stringArray,
+  stringValue,
+} from './validation.js';
 
-const SERVER_INSTRUCTIONS = 'Before changing code, call project_memory_context with the task and affected paths. Treat only approvedRules as rules; history is advisory evidence. After verified work, record durable decisions, corrections or outcomes. Propose reusable rules as candidates. Chat review requires client-mediated human elicitation; agents cannot approve candidates. Never store secrets, raw transcripts or unsupported claims.';
+const SERVER_INSTRUCTIONS = 'Before changing code, call project_memory_context with the task and affected paths. Treat only approvedRules as rules; history is advisory evidence. After verified work, record durable decisions, corrections or outcomes. Propose reusable rules as candidates and classify them with area:, language: and test: tags when applicable. Chat review requires client-mediated human elicitation; agents cannot approve, revoke or restore rules. Revoked rules remain in immutable history and may be restored only by a later human approval. Never store secrets, raw transcripts or unsupported claims.';
 
 export type ProjectMemoryRuntimeIdentity = {
   developerId?: string;
@@ -29,7 +47,13 @@ export type ProjectMemoryRuntimeIdentity = {
 
 export type ProjectMemoryHumanReview = (
   candidate: MemoryRecord,
-) => Promise<{ verdict: ReviewVerdict; reason: string; developerId: string } | undefined>;
+  classification: RuleClassification,
+) => Promise<{
+  verdict: ReviewVerdict;
+  reason: string;
+  developerId: string;
+  classification?: RuleClassification;
+} | undefined>;
 
 const objectSchema = { type: 'object', additionalProperties: false } as const;
 const evidenceSchema = {
@@ -65,7 +89,7 @@ const recordOutputSchema = {
 export const PROJECT_MEMORY_TOOLS: Tool[] = [
   {
     name: 'project_memory_context',
-    description: 'Retrieve bounded project decisions, corrections, outcomes and human-approved rules before planning or editing.',
+    description: 'Retrieve bounded project context and automatically select compatible human-approved rules from the task and affected paths.',
     inputSchema: {
       ...objectSchema,
       properties: {
@@ -80,15 +104,41 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
       properties: {
         projectId: { type: 'string' },
         query: { type: 'string' },
+        classification: { type: 'object' },
         approvedRules: { type: 'array', items: recordOutputSchema },
+        ruleMatches: { type: 'array', items: { type: 'object' } },
         relevantHistory: { type: 'array', items: recordOutputSchema },
         conflicts: { type: 'array', items: { type: 'object' } },
         truncated: { type: 'boolean' },
         notices: { type: 'array', items: { type: 'string' } },
       },
       required: [
-        'projectId', 'query', 'approvedRules', 'relevantHistory', 'conflicts', 'truncated', 'notices',
+        'projectId', 'query', 'classification', 'approvedRules', 'ruleMatches',
+        'relevantHistory', 'conflicts', 'truncated', 'notices',
       ],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+  },
+  {
+    name: 'project_memory_explain_context',
+    description: 'Explain why approved rules were selected or excluded for a task without changing project state.',
+    inputSchema: {
+      ...objectSchema,
+      properties: {
+        task: { type: 'string', minLength: 1, maxLength: 4000 },
+        paths: { type: 'array', maxItems: 30, items: { type: 'string', maxLength: 256 } },
+        limit: { type: 'integer', minimum: 1, maximum: 200, default: 100 },
+      },
+      required: ['task'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        context: { type: 'object' },
+        decisions: { type: 'array', items: { type: 'object' } },
+        truncated: { type: 'boolean' },
+      },
+      required: ['context', 'decisions', 'truncated'],
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
   },
@@ -115,15 +165,17 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
         candidates: { type: 'integer' },
         approvedRules: { type: 'integer' },
         rejectedRules: { type: 'integer' },
+        revokedRules: { type: 'integer' },
         reviewConflicts: { type: 'integer' },
         storeDigest: { type: 'string', pattern: '^[a-f0-9]{64}$' },
         contributors: { type: 'array', items: { type: 'object' } },
         corruptedRecords: { type: 'array', items: { type: 'string' } },
+        taxonomyWarnings: { type: 'array', items: { type: 'string' } },
         integration: { type: 'object' },
       },
       required: [
-        'projectId', 'records', 'candidates', 'approvedRules', 'rejectedRules', 'reviewConflicts',
-        'storeDigest', 'contributors', 'corruptedRecords', 'integration',
+        'projectId', 'records', 'candidates', 'approvedRules', 'rejectedRules', 'revokedRules', 'reviewConflicts',
+        'storeDigest', 'contributors', 'corruptedRecords', 'taxonomyWarnings', 'integration',
       ],
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
@@ -144,6 +196,50 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
         items: { type: 'array', items: { type: 'object' } },
         nextCursor: { type: 'string' },
       },
+      required: ['items'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+  },
+  {
+    name: 'project_memory_rules',
+    description: 'List rules sorted by area, language and test type, with optional classification and lifecycle filters.',
+    inputSchema: {
+      ...objectSchema,
+      properties: {
+        state: {
+          type: 'string',
+          enum: ['pending', 'approved', 'rejected', 'revoked', 'superseded', 'conflict'],
+        },
+        area: { type: 'string', minLength: 1, maxLength: 64 },
+        language: { type: 'string', minLength: 1, maxLength: 64 },
+        testType: { type: 'string', minLength: 1, maxLength: 64 },
+        cursor: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 50 },
+      },
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        items: { type: 'array', items: { type: 'object' } },
+        nextCursor: { type: 'string' },
+        total: { type: 'integer' },
+        filters: { type: 'object' },
+      },
+      required: ['items', 'total', 'filters'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+  },
+  {
+    name: 'project_memory_rule_history',
+    description: 'Read the immutable human review history for one rule, including revocation, restoration, reviewer, reason and date.',
+    inputSchema: {
+      ...objectSchema,
+      properties: { id: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
+      required: ['id'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: { items: { type: 'array', items: { type: 'object' } } },
       required: ['items'],
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
@@ -229,6 +325,18 @@ function result(value: unknown): CallToolResult {
   };
 }
 
+function classificationFormValue(value: unknown, fallback: string[], name: string): string[] {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string') throw new Error(`${name} must be a comma-separated string`);
+  const items = value.split(',').map((item) => item.trim()).filter(Boolean);
+  const globalItems = items.filter((item) => ['global', '*'].includes(item.toLocaleLowerCase()));
+  if (globalItems.length > 0) {
+    if (items.length === 1) return [];
+    throw new Error(`${name} cannot combine global with named facets`);
+  }
+  return items;
+}
+
 /** Executes one validated provider-neutral memory tool against a project root. */
 export async function callProjectMemoryTool(
   store: ProjectMemoryStore,
@@ -253,14 +361,37 @@ export async function callProjectMemoryTool(
     const integration = await inspectProjectMemoryIntegration(store.root);
     return result({ ...context, notices: integration.notices });
   }
+  if (name === 'project_memory_explain_context') {
+    const task = stringValue(args.task, 'task', 4000);
+    const paths = stringArray(args.paths, 'paths', 30, 256)
+      .map((path, index) => relativeProjectPath(path, `paths[${index}]`));
+    const limit = args.limit === undefined ? 100 : Number(args.limit);
+    return result(await explainMemoryContext(store, task, paths, limit));
+  }
   if (name === 'project_memory_get') return result(await store.readRecord(stringValue(args.id, 'id', 64)));
   if (name === 'project_memory_status') {
-    return result({ ...await store.status(), integration: await inspectProjectMemoryIntegration(store.root) });
+    return result({
+      ...await store.status(),
+      taxonomyWarnings: await inspectRuleTaxonomy(store),
+      integration: await inspectProjectMemoryIntegration(store.root),
+    });
   }
   if (name === 'project_memory_candidates') {
     const cursor = args.cursor === undefined ? undefined : stringValue(args.cursor, 'cursor', 64);
     const limit = args.limit === undefined ? 20 : Number(args.limit);
     return result(await listRuleCandidates(store, cursor, limit));
+  }
+  if (name === 'project_memory_rules') {
+    const limit = args.limit === undefined ? 50 : Number(args.limit);
+    return result(await listRules(store, {
+      state: args.state === undefined ? undefined : stringValue(args.state, 'state', 16) as RuleCandidateState,
+      area: args.area === undefined ? undefined : stringValue(args.area, 'area', 64),
+      language: args.language === undefined ? undefined : stringValue(args.language, 'language', 64),
+      testType: args.testType === undefined ? undefined : stringValue(args.testType, 'testType', 64),
+    }, args.cursor === undefined ? undefined : stringValue(args.cursor, 'cursor', 64), limit));
+  }
+  if (name === 'project_memory_rule_history') {
+    return result({ items: await store.ruleHistory(stringValue(args.id, 'id', 64)) });
   }
   if (name === 'project_memory_record') {
     const input = parseRecordInput({ ...args, ...runtimeIdentity });
@@ -277,9 +408,17 @@ export async function callProjectMemoryTool(
     const candidate = await store.readRecord(id);
     if (candidate.kind !== 'rule_candidate') throw new Error('Only rule candidates can be reviewed');
     if (!options.humanReview) throw new Error('Chat review requires a client with MCP form elicitation support');
-    const decision = await options.humanReview(candidate);
+    const reviewState = resolveReviewStates(await store.ruleHistory(id));
+    const classification = reviewState.latest.get(id)?.classification ?? classifyRule(candidate);
+    const decision = await options.humanReview(candidate, classification);
     if (!decision) return result({ reviewed: false, reason: 'Human declined or cancelled review' });
-    const review = await store.review(id, decision.verdict, decision.reason, decision.developerId);
+    const review = await store.review(
+      id,
+      decision.verdict,
+      decision.reason,
+      decision.developerId,
+      parseRuleClassification(decision.classification ?? classification),
+    );
     return result({ reviewed: true, ...review });
   }
   throw new Error(`Unknown tool: ${name}`);
@@ -307,13 +446,13 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
     try {
       return await callProjectMemoryTool(store, request.params.name, request.params.arguments, {
         identity,
-        humanReview: async (candidate) => {
+        humanReview: async (candidate, classification) => {
           if (!server.getClientCapabilities()?.elicitation) {
             throw new Error('Connected client does not support MCP form elicitation; use the CLI fallback');
           }
           const elicited = await server.elicitInput({
             mode: 'form',
-            message: `Review project rule ${candidate.id}: ${candidate.summary}`,
+            message: `Review project rule ${candidate.id}: ${candidate.summary}. Confirm or edit its applicability. Empty facet fields mean global for that dimension.`,
             requestedSchema: {
               type: 'object',
               properties: {
@@ -323,22 +462,43 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
                   oneOf: [
                     { const: 'approved', title: 'Approve' },
                     { const: 'rejected', title: 'Reject' },
+                    { const: 'revoked', title: 'Revoke approved rule' },
                     { const: 'superseded', title: 'Supersede' },
                   ],
                 },
                 reason: { type: 'string', title: 'Reason', minLength: 1, maxLength: 2000 },
                 developerId: { type: 'string', title: 'Developer ID', minLength: 1, maxLength: 128 },
+                areas: {
+                  type: 'string', title: 'Areas (comma-separated)', default: classification.areas.join(', '),
+                },
+                languages: {
+                  type: 'string', title: 'Languages (comma-separated)', default: classification.languages.join(', '),
+                },
+                testTypes: {
+                  type: 'string', title: 'Test types (comma-separated)', default: classification.testTypes.join(', '),
+                },
               },
-              required: ['verdict', 'reason', 'developerId'],
+              required: ['verdict', 'reason', 'developerId', 'areas', 'languages', 'testTypes'],
             },
           });
           if (elicited.action !== 'accept' || !elicited.content) return undefined;
           const verdict = stringValue(elicited.content.verdict, 'verdict', 16) as ReviewVerdict;
-          if (!['approved', 'rejected', 'superseded'].includes(verdict)) throw new Error('Invalid human verdict');
+          if (!['approved', 'rejected', 'revoked', 'superseded'].includes(verdict)) {
+            throw new Error('Invalid human verdict');
+          }
           return {
             verdict,
             reason: stringValue(elicited.content.reason, 'reason', 2000),
             developerId: stringValue(elicited.content.developerId, 'developerId', 128),
+            classification: parseRuleClassification({
+              areas: classificationFormValue(elicited.content.areas, classification.areas, 'areas'),
+              languages: classificationFormValue(
+                elicited.content.languages, classification.languages, 'languages',
+              ),
+              testTypes: classificationFormValue(
+                elicited.content.testTypes, classification.testTypes, 'testTypes',
+              ),
+            }),
           };
         },
       });
@@ -364,7 +524,11 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
         contents: [{
           uri: request.params.uri,
           mimeType: 'application/json',
-          text: JSON.stringify({ ...await store.status(), integration: await inspectProjectMemoryIntegration(root) }),
+          text: JSON.stringify({
+            ...await store.status(),
+            taxonomyWarnings: await inspectRuleTaxonomy(store),
+            integration: await inspectProjectMemoryIntegration(root),
+          }),
         }],
       };
     }
