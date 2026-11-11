@@ -1,0 +1,60 @@
+{
+  "name": "prooflore",
+  "version": "0.1.1",
+  "description": "Provider-neutral, provenance-preserving project memory for coding agents",
+  "keywords": [
+    "ai",
+    "coding-agents",
+    "mcp",
+    "memory"
+  ],
+  "homepage": "https://github.com/koterion/prooflore#readme",
+  "bugs": {
+    "url": "https://github.com/koterion/prooflore/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/koterion/prooflore.git"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "prooflore": "dist/cli.js",
+    "prooflore-mcp": "dist/mcp.js"
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/prepare-bin.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify": "npm run typecheck && npm run build && npm --cache .npm-cache pack --dry-run",
+    "prepublishOnly": "npm run verify",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "author": ""
+}
