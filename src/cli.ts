@@ -11,6 +11,7 @@ import {
   listRuleCandidates,
   listRules,
 } from './context.js';
+import { resolveProjectMemoryIdentity, setProjectMemoryIdentity } from './identity.js';
 import { runProjectMemoryMcp } from './mcp.js';
 import {
   checkProjectMemorySetup,
@@ -52,7 +53,7 @@ function validateReviewArguments(args: string[]): void {
 }
 
 function usage(): never {
-  throw new Error('Usage: prooflore setup|update|sync [--project ID] [--provider codex|claude|cursor] [--dry-run|--check] [--accept-rule-migration] | init --project ID | doctor | context TASK [--path PATH] | explain-context TASK [--path PATH] [--limit N] | candidates [--cursor ID] [--limit N] | rules [--state STATE] [--area AREA] [--language LANGUAGE] [--test-type TYPE] [--cursor ID] [--limit N] | history ID | record --file JSON | review ID approved|rejected|revoked|superseded --reason TEXT --developer ID [--area A,B|global] [--language L|global] [--test-type T|global] | mcp');
+  throw new Error('Usage: prooflore setup|update|sync [--project ID] [--provider codex|claude|cursor] [--dry-run|--check] [--accept-rule-migration] | init --project ID | identity set DEVELOPER_ID | identity show | doctor | context TASK [--path PATH] | explain-context TASK [--path PATH] [--limit N] | candidates [--cursor ID] [--limit N] | rules [--state STATE] [--area AREA] [--language LANGUAGE] [--test-type TYPE] [--cursor ID] [--limit N] | history ID | record --file JSON | review ID approved|rejected|revoked|superseded --reason TEXT --developer ID [--area A,B|global] [--language L|global] [--test-type T|global] | mcp');
 }
 
 /** Runs the ProofLore administration CLI. */
@@ -92,12 +93,27 @@ export async function runCli(args = process.argv.slice(2), root = process.cwd())
     });
   }
   if (command === 'init') return store.initialize(option(args, '--project') ?? usage());
+  if (command === 'identity') {
+    if (args[1] === 'set' && args.length === 3) {
+      const identity = await setProjectMemoryIdentity(root, args[2]);
+      return { configured: true, developerId: identity.developerId, source: 'local' };
+    }
+    if (args[1] === 'show' && args.length === 2) return resolveProjectMemoryIdentity(root);
+    return usage();
+  }
   if (command === 'doctor') {
     const status = await store.status();
     if (status.corruptedRecords.length > 0) throw new Error(`Corrupted records: ${status.corruptedRecords.join(', ')}`);
     const setup = await checkProjectMemorySetup(root);
     const taxonomyWarnings = await inspectRuleTaxonomy(store);
-    return { ok: status.reviewConflicts === 0 && (setup?.ok ?? true), ...status, taxonomyWarnings, setup };
+    const identity = await resolveProjectMemoryIdentity(root);
+    return {
+      ok: status.reviewConflicts === 0 && identity.configured && (setup?.ok ?? true),
+      ...status,
+      identity,
+      taxonomyWarnings,
+      setup,
+    };
   }
   if (command === 'candidates') {
     const limitValue = option(args, '--limit');

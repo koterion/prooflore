@@ -1,6 +1,6 @@
 {
   "name": "prooflore",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Provider-neutral, provenance-preserving project memory for coding agents",
   "keywords": [
     "ai",

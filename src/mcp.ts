@@ -20,6 +20,7 @@ import {
   listRuleCandidates,
   listRules,
 } from './context.js';
+import { resolveProjectMemoryIdentity } from './identity.js';
 import { inspectProjectMemoryIntegration, projectMemoryPackageVersion } from './setup.js';
 import { ProjectMemoryStore, resolveReviewStates } from './store.js';
 import type {
@@ -36,7 +37,7 @@ import {
   stringValue,
 } from './validation.js';
 
-const SERVER_INSTRUCTIONS = 'Before changing code, call project_memory_context with the task and affected paths. Treat only approvedRules as rules; history is advisory evidence. After verified work, record durable decisions, corrections or outcomes. Propose reusable rules as candidates and classify them with area:, language: and test: tags when applicable. Chat review requires client-mediated human elicitation; agents cannot approve, revoke or restore rules. Revoked rules remain in immutable history and may be restored only by a later human approval. Never store secrets, raw transcripts or unsupported claims.';
+const SERVER_INSTRUCTIONS = 'Before changing code, call project_memory_context with the task and affected paths. Treat only approvedRules as rules; history is advisory evidence. After verified work, record durable decisions, corrections or outcomes. Agent writes use the server-bound developer identity; never infer or supply developerId. Propose reusable rules as candidates and classify them with area:, language: and test: tags when applicable. Chat review requires client-mediated human elicitation; agents cannot approve, revoke or restore rules. Revoked rules remain in immutable history and may be restored only by a later human approval. Never store secrets, raw transcripts or unsupported claims.';
 
 export type ProjectMemoryRuntimeIdentity = {
   developerId?: string;
@@ -171,11 +172,12 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
         contributors: { type: 'array', items: { type: 'object' } },
         corruptedRecords: { type: 'array', items: { type: 'string' } },
         taxonomyWarnings: { type: 'array', items: { type: 'string' } },
+        identity: { type: 'object' },
         integration: { type: 'object' },
       },
       required: [
         'projectId', 'records', 'candidates', 'approvedRules', 'rejectedRules', 'revokedRules', 'reviewConflicts',
-        'storeDigest', 'contributors', 'corruptedRecords', 'taxonomyWarnings', 'integration',
+        'storeDigest', 'contributors', 'corruptedRecords', 'taxonomyWarnings', 'identity', 'integration',
       ],
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
@@ -256,10 +258,6 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
         tags: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 64 } },
         scope: { type: 'array', maxItems: 30, items: { type: 'string', maxLength: 256 } },
         evidence: { type: 'array', maxItems: 20, items: evidenceSchema },
-        developerId: { type: 'string', minLength: 1, maxLength: 128 },
-        provider: { type: 'string', minLength: 1, maxLength: 64 },
-        model: { type: 'string', minLength: 1, maxLength: 128 },
-        sessionId: { type: 'string', minLength: 1, maxLength: 128 },
         supersedes: { type: 'array', maxItems: 20, items: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
       },
       required: ['kind', 'summary'],
@@ -282,10 +280,6 @@ export const PROJECT_MEMORY_TOOLS: Tool[] = [
         tags: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 64 } },
         scope: { type: 'array', maxItems: 30, items: { type: 'string', maxLength: 256 } },
         evidence: { type: 'array', minItems: 1, maxItems: 20, items: evidenceSchema },
-        developerId: { type: 'string', minLength: 1, maxLength: 128 },
-        provider: { type: 'string', minLength: 1, maxLength: 64 },
-        model: { type: 'string', minLength: 1, maxLength: 128 },
-        sessionId: { type: 'string', minLength: 1, maxLength: 128 },
         supersedes: { type: 'array', maxItems: 20, items: { type: 'string', pattern: '^[a-f0-9]{64}$' } },
       },
       required: ['summary', 'rationale', 'evidence'],
@@ -337,6 +331,14 @@ function classificationFormValue(value: unknown, fallback: string[], name: strin
   return items;
 }
 
+function boundAgentIdentity(identity: ProjectMemoryRuntimeIdentity | undefined): Record<string, string> {
+  if (!identity?.developerId) {
+    throw new Error('ProofLore developer identity is not configured; run `npx prooflore identity set DEVELOPER_ID`');
+  }
+  return Object.fromEntries(Object.entries(identity)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0));
+}
+
 /** Executes one validated provider-neutral memory tool against a project root. */
 export async function callProjectMemoryTool(
   store: ProjectMemoryStore,
@@ -349,8 +351,6 @@ export async function callProjectMemoryTool(
 ): Promise<CallToolResult> {
   const args = argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)
     ? argumentsValue as Record<string, unknown> : {};
-  const runtimeIdentity = Object.fromEntries(Object.entries(options.identity ?? {})
-    .filter(([, value]) => value !== undefined));
   if (name === 'project_memory_context') {
     const task = stringValue(args.task, 'task', 4000);
     const paths = stringArray(args.paths, 'paths', 30, 256)
@@ -370,10 +370,12 @@ export async function callProjectMemoryTool(
   }
   if (name === 'project_memory_get') return result(await store.readRecord(stringValue(args.id, 'id', 64)));
   if (name === 'project_memory_status') {
+    const integration = await inspectProjectMemoryIntegration(store.root);
     return result({
       ...await store.status(),
       taxonomyWarnings: await inspectRuleTaxonomy(store),
-      integration: await inspectProjectMemoryIntegration(store.root),
+      identity: integration.identity,
+      integration,
     });
   }
   if (name === 'project_memory_candidates') {
@@ -394,11 +396,13 @@ export async function callProjectMemoryTool(
     return result({ items: await store.ruleHistory(stringValue(args.id, 'id', 64)) });
   }
   if (name === 'project_memory_record') {
+    const runtimeIdentity = boundAgentIdentity(options.identity);
     const input = parseRecordInput({ ...args, ...runtimeIdentity });
     if (input.kind === 'rule_candidate') throw new Error('Use project_memory_propose_rule for rule candidates');
     return result(await store.record(input, 'agent'));
   }
   if (name === 'project_memory_propose_rule') {
+    const runtimeIdentity = boundAgentIdentity(options.identity);
     return result(await store.record(parseRecordInput({
       ...args, ...runtimeIdentity, kind: 'rule_candidate',
     }), 'agent'));
@@ -435,8 +439,9 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
     { name: 'project-memory', version },
     { capabilities: { tools: {}, resources: {} }, instructions },
   );
+  const resolvedIdentity = await resolveProjectMemoryIdentity(root);
   const identity: ProjectMemoryRuntimeIdentity = {
-    developerId: process.env.PROJECT_MEMORY_DEVELOPER_ID,
+    developerId: resolvedIdentity.developerId,
     provider: process.env.PROJECT_MEMORY_PROVIDER,
     model: process.env.PROJECT_MEMORY_MODEL,
     sessionId: process.env.PROJECT_MEMORY_SESSION_ID,
@@ -520,6 +525,7 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
       return { contents: [{ uri: request.params.uri, mimeType: 'text/markdown', text: instructions }] };
     }
     if (request.params.uri === 'project-memory://status') {
+      const currentIntegration = await inspectProjectMemoryIntegration(root);
       return {
         contents: [{
           uri: request.params.uri,
@@ -527,7 +533,8 @@ export async function runProjectMemoryMcp(root = process.env.PROJECT_MEMORY_ROOT
           text: JSON.stringify({
             ...await store.status(),
             taxonomyWarnings: await inspectRuleTaxonomy(store),
-            integration: await inspectProjectMemoryIntegration(root),
+            identity: currentIntegration.identity,
+            integration: currentIntegration,
           }),
         }],
       };

@@ -19,6 +19,7 @@ Requires Node.js 20 or newer.
 ```sh
 npm install --save-dev prooflore
 npx prooflore setup
+npx prooflore identity set YOUR_DEVELOPER_ID
 ```
 
 To preview the planned changes without writing files:
@@ -47,6 +48,8 @@ ProofLore creates a project-local store:
   config.json
   setup.json
   AGENT_WORKFLOW.md
+  local/
+    identity.json        # ignored, local to this developer
   records/
     <sha256>.json
 ```
@@ -172,7 +175,17 @@ key are excluded fail-closed and visible through `explain-context`.
 
 ## Team identity
 
-For consistent attribution, configure a stable developer ID in the MCP environment:
+Configure the identity once for each local checkout:
+
+```sh
+npx prooflore identity set koterion
+npx prooflore identity show
+```
+
+ProofLore stores it in ignored `.prooflore/local/identity.json`. Agents cannot choose
+or override this identity, and agent writes fail closed until it is configured.
+
+Automation and CI may override the local value through the MCP environment:
 
 ```text
 PROJECT_MEMORY_DEVELOPER_ID
@@ -181,8 +194,9 @@ PROJECT_MEMORY_MODEL
 PROJECT_MEMORY_SESSION_ID
 ```
 
-Server-bound values take precedence over values supplied by an agent. Developer IDs
-are provenance labels, not authentication.
+`PROJECT_MEMORY_DEVELOPER_ID` takes precedence over the local value. Provider, model
+and session values are optional runtime provenance. Developer IDs are provenance
+labels, not authentication.
 
 ## Updates
 
@@ -219,6 +233,8 @@ than replacing the existing command.
 | `prooflore update` | Reconcile an existing installation |
 | `prooflore sync` | Setup/update command suitable for package lifecycle scripts |
 | `prooflore init --project ID` | Initialize only the memory store |
+| `prooflore identity set ID` | Store this checkout's ignored developer identity |
+| `prooflore identity show` | Show the effective developer identity and its source |
 | `prooflore doctor` | Verify records, reviews and managed setup |
 | `prooflore context TASK --path PATH` | Retrieve bounded local context |
 | `prooflore explain-context TASK --path PATH` | Explain rule selection and exclusions |
@@ -240,6 +256,7 @@ than replacing the existing command.
 - Reviews with missing targets, invalid parents or modified classifications fail closed.
 - Corrupted, tampered or foreign-project records fail closed.
 - Agents cannot supply human rule-review verdicts.
+- Agent writes use only the server-bound developer identity and fail closed when it is missing.
 - The package does not execute project code or modify global provider configuration.
 
 Normal client approval and project-trust controls still apply.
@@ -250,6 +267,11 @@ Normal client approval and project-trust controls still apply.
 
 Run `npx prooflore doctor`, confirm the client-specific configuration exists, then
 restart the agent session.
+
+### Agent writes report that developer identity is not configured
+
+Run `npx prooflore identity set YOUR_DEVELOPER_ID`, verify it with
+`npx prooflore identity show`, then restart the agent session.
 
 ### Setup or `postinstall` stops
 
