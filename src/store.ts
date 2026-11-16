@@ -125,6 +125,7 @@ function parseStoredRecord(value: unknown): StoredRecord {
       id,
       projectId,
       kind: 'review',
+      localOnly: record.localOnly === true ? true : undefined,
       targetId: recordIdValue(record.targetId, 'stored targetId'),
       previousReviewId: record.previousReviewId === undefined
         ? undefined : recordIdValue(record.previousReviewId, 'stored previousReviewId'),
@@ -135,6 +136,7 @@ function parseStoredRecord(value: unknown): StoredRecord {
       reason: stringValue(record.reason, 'stored review reason', 2000),
       classification: record.classification === undefined
         ? undefined : parseRuleClassification(record.classification, 'stored classification'),
+      tags: record.tags === undefined ? undefined : stringArray(record.tags, 'stored review tags', 20, 64),
       actor: { ...actor, kind: 'human' },
       createdAt,
     };
@@ -156,8 +158,10 @@ function parseStoredRecord(value: unknown): StoredRecord {
     id,
     projectId,
     kind: input.kind,
+    localOnly: input.localOnly,
     summary: input.summary,
     rationale: input.rationale,
+    ruleAssessment: input.ruleAssessment,
     tags: input.tags ?? [],
     scope: input.scope ?? [],
     evidence: input.evidence ?? [],
@@ -173,8 +177,10 @@ function memoryContent(record: Omit<MemoryRecord, 'schemaVersion' | 'id' | 'crea
   return {
     projectId: record.projectId,
     kind: record.kind,
+    localOnly: record.localOnly,
     summary: record.summary,
     rationale: record.rationale,
+    ruleAssessment: record.ruleAssessment,
     tags: record.tags,
     scope: record.scope,
     evidence: record.evidence,
@@ -187,12 +193,14 @@ function reviewContent(record: Omit<ReviewRecord, 'schemaVersion' | 'id' | 'crea
   return {
     projectId: record.projectId,
     kind: 'review',
+    localOnly: record.localOnly,
     targetId: record.targetId,
     previousReviewId: record.previousReviewId,
     previousReviewIds: record.previousReviewIds,
     verdict: record.verdict,
     reason: record.reason,
     classification: record.classification,
+    tags: record.tags,
     actor: record.actor,
   };
 }
@@ -239,6 +247,71 @@ export class ProjectMemoryStore {
   private async assertStoreDirectories(): Promise<void> {
     await this.assertSafeDirectory(this.directory);
     await this.assertSafeDirectory(this.recordsDirectory);
+  }
+
+  /** Resolves the private store and checks that its path cannot escape through symlinks. */
+  private async localRecordsDirectory(create = false): Promise<string | undefined> {
+    const local = join(this.directory, 'local');
+    const records = join(local, RECORD_DIRECTORY);
+    if (create) {
+      const ignorePath = join(this.directory, IGNORE_FILE);
+      const metadata = await lstat(ignorePath);
+      if (!metadata.isFile() || metadata.isSymbolicLink()
+        || !(await readFile(ignorePath, 'utf8')).split(/\r?\n/u).includes('/local/')) {
+        throw new Error('Run prooflore sync before saving local rules so the local directory is ignored');
+      }
+    }
+    for (const path of [local, records]) {
+      if (create) await mkdir(path, { recursive: true, mode: 0o700 });
+      try {
+        await this.assertSafeDirectory(path);
+      } catch (error) {
+        if (!create && (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      }
+    }
+    return records;
+  }
+
+  /** Stores an immutable recovery entry outside the shared rule catalog. */
+  async writeEditRecovery(key: string, value: unknown): Promise<boolean> {
+    const path = await this.editRecoveryPath(key, true);
+    return atomicJsonCreate(path, value);
+  }
+
+  /** Reads a recovery entry after an MCP restart. */
+  async readEditRecovery(key: string): Promise<unknown> {
+    try {
+      const path = await this.editRecoveryPath(key, false);
+      const metadata = await lstat(path);
+      if (!metadata.isFile() || metadata.size > MAX_RECORD_BYTES) throw new Error('Invalid edit recovery file');
+      return JSON.parse(await readFile(path, 'utf8'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  /** Resolves a validated recovery file inside the ignored local directory. */
+  private async editRecoveryPath(key: string, create: boolean): Promise<string> {
+    if (!/^(?:[a-f0-9-]{36}|(?:pending-)?[a-f0-9]{64})$/u.test(key)) throw new Error('Invalid edit recovery key');
+    const records = await this.localRecordsDirectory(create);
+    if (!records) throw Object.assign(new Error('No local recovery directory'), { code: 'ENOENT' });
+    const local = resolve(records, '..');
+    const directory = join(local, 'rule-edits');
+    if (create) await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    await this.assertSafeDirectory(directory);
+    return join(directory, `${key}.json`);
+  }
+
+  /** Enumerates record filenames in both visibility scopes. */
+  private async recordNames(): Promise<string[]> {
+    const local = await this.localRecordsDirectory();
+    const sharedNames = await readdir(this.recordsDirectory);
+    const localNames = local ? await readdir(local) : [];
+    return [...new Set([...sharedNames, ...localNames])].filter((name) => name.endsWith('.json')).sort();
   }
 
   /** Initializes a project store without overwriting an existing configuration. */
@@ -298,6 +371,22 @@ export class ProjectMemoryStore {
     if (input.kind === 'rule_candidate' && (!input.rationale || (input.evidence?.length ?? 0) === 0)) {
       throw new Error('Rule candidates require rationale and evidence');
     }
+    const assessment = input.ruleAssessment;
+    const relatedIds = [...(input.supersedes ?? []), ...(assessment
+      ? 'candidateIds' in assessment ? assessment.candidateIds : assessment.existingRuleId ? [assessment.existingRuleId] : []
+      : [])];
+    let localOnly = input.localOnly;
+    for (const id of relatedIds) {
+      const related = await this.readRecordUnchecked(id).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (related?.localOnly || (input.kind === 'outcome' && related?.kind === 'rule_candidate'
+        && !(await lstat(join(this.recordsDirectory, `${id}.json`)).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        })))) localOnly = true;
+    }
     const actor: MemoryActor = {
       kind: source,
       developerId: input.developerId,
@@ -308,8 +397,10 @@ export class ProjectMemoryStore {
     const content: Omit<MemoryRecord, 'schemaVersion' | 'id' | 'createdAt'> = {
       projectId: config.projectId,
       kind: input.kind,
+      localOnly,
       summary: input.summary,
       rationale: input.rationale,
+      ruleAssessment: input.ruleAssessment,
       tags: [...new Set(input.tags ?? [])].sort(),
       scope: [...new Set(input.scope ?? [])].sort(),
       evidence: input.evidence ?? [],
@@ -317,7 +408,9 @@ export class ProjectMemoryStore {
       supersedes: [...new Set(input.supersedes ?? [])].sort(),
     };
     const id = digest(memoryContent(content));
-    const path = join(this.recordsDirectory, `${id}.json`);
+    const directory = localOnly || input.kind === 'rule_candidate'
+      ? (await this.localRecordsDirectory(true))! : this.recordsDirectory;
+    const path = join(directory, `${id}.json`);
     const prior = await this.readRecord(id).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
@@ -348,6 +441,8 @@ export class ProjectMemoryStore {
     reason: string,
     developerId: string,
     classification?: RuleClassification,
+    tags?: string[],
+    idempotent = false,
   ): Promise<{ review: ReviewRecord; created: boolean }> {
     const target = await this.readRecord(targetId);
     if (target.kind !== 'rule_candidate') throw new Error('Only rule candidates can be reviewed');
@@ -369,19 +464,43 @@ export class ProjectMemoryStore {
       throw new Error('Invalid review verdict');
     }
     const latestReview = reviewState.latest.get(targetId);
+    const reviewTags = tags === undefined ? latestReview?.tags : stringArray(tags, 'review tags', 20, 64);
+    reviewTags?.forEach((tag) => assertNoSecrets(tag, 'review tag'));
+    if (idempotent) {
+      const prior = existingRecords.find((record): record is ReviewRecord => record.kind === 'review'
+        && record.targetId === targetId && record.verdict === verdict && record.actor.developerId === actor.developerId
+        && record.reason === validatedReason && canonical(record.classification) === canonical(classification)
+        && canonical(record.tags) === canonical(reviewTags));
+      if (prior) {
+        if (verdict === 'approved' && !prior.localOnly) {
+          await atomicJsonCreate(join(this.recordsDirectory, `${target.id}.json`), target);
+        }
+        return { review: prior, created: false };
+      }
+    }
     if (verdict === 'revoked' && latestReview?.verdict !== 'approved') {
       throw new Error('Only an approved rule can be revoked');
     }
+    const previouslyShared = existingRecords.some((record) => record.kind === 'review'
+      && record.targetId === targetId && record.verdict === 'approved' && !record.localOnly);
+    if (verdict === 'rejected' && previouslyShared) {
+      throw new Error('Use revoke to retire a previously shared rule');
+    }
+    const localOnly = target.localOnly || (verdict === 'rejected'
+      || (verdict === 'superseded' && !previouslyShared) ? true : undefined);
+    const previousReviewIds = conflictHeads ?? (latestReview ? [latestReview.id] : undefined);
     const content: Omit<ReviewRecord, 'schemaVersion' | 'id' | 'createdAt'> = {
       projectId: target.projectId,
       kind: 'review' as const,
+      localOnly,
       targetId,
-      previousReviewIds: conflictHeads ?? (reviewState.latest.get(targetId)
-        ? [reviewState.latest.get(targetId)!.id] : undefined),
+      previousReviewIds: localOnly ? previousReviewIds : previousReviewIds?.filter((id) =>
+        existingRecords.some((record) => record.id === id && !record.localOnly)),
       verdict,
       reason: validatedReason,
       classification: classification === undefined
         ? latestReview?.classification : parseRuleClassification(classification),
+      tags: reviewTags,
       actor,
     };
     const id = digest(reviewContent(content));
@@ -399,7 +518,11 @@ export class ProjectMemoryStore {
       ...content,
       createdAt: new Date().toISOString(),
     };
-    const created = await atomicJsonCreate(join(this.recordsDirectory, `${id}.json`), review);
+    const directory = localOnly ? (await this.localRecordsDirectory(true))! : this.recordsDirectory;
+    const created = await atomicJsonCreate(join(directory, `${id}.json`), review);
+    if (verdict === 'approved' && !localOnly) {
+      await atomicJsonCreate(join(this.recordsDirectory, `${target.id}.json`), target);
+    }
     if (!created) {
       const existing = await this.readRecord(id);
       if (existing.kind !== 'review') throw new Error('Review id collision');
@@ -410,17 +533,27 @@ export class ProjectMemoryStore {
 
   private async readRecordUnchecked(id: string): Promise<StoredRecord> {
     if (!/^[a-f0-9]{64}$/u.test(id)) throw new Error('Invalid record id');
-    const path = join(this.recordsDirectory, `${id}.json`);
-    const metadata = await lstat(path);
+    let path = join(this.recordsDirectory, `${id}.json`);
+    let localOnly = false;
+    const metadata = await lstat(path).catch(async (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const local = await this.localRecordsDirectory();
+      if (!local) throw error;
+      path = join(local, `${id}.json`);
+      localOnly = true;
+      return lstat(path);
+    });
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_RECORD_BYTES) {
       throw new Error(`Invalid record file: ${id}`);
     }
-    const signature = [metadata.dev, metadata.ino, metadata.mode, metadata.size, metadata.mtimeMs, metadata.ctimeMs]
+    const signature = [path, metadata.dev, metadata.ino, metadata.mode, metadata.size, metadata.mtimeMs, metadata.ctimeMs]
       .join(':');
     const cached = this.recordCache.get(id);
     if (cached?.signature === signature) return structuredClone(cached.record);
     const record = parseStoredRecord(JSON.parse(await readFile(path, 'utf8')));
-    if (record.id !== id) throw new Error(`Record content id mismatch: ${id}`);
+    const validVisibility = record.kind === 'rule_candidate' && localOnly
+      || Boolean(record.localOnly) === localOnly;
+    if (record.id !== id || !validVisibility) throw new Error(`Record content or visibility mismatch: ${id}`);
     this.recordCache.set(id, { signature, record: structuredClone(record) });
     return structuredClone(record);
   }
@@ -432,7 +565,10 @@ export class ProjectMemoryStore {
     if (record.projectId !== config.projectId) throw new Error(`Foreign project record: ${id}`);
     if (record.kind === 'review') {
       const target = await this.readRecordUnchecked(record.targetId).catch(() => undefined);
-      if (!target || target.projectId !== config.projectId || target.kind !== 'rule_candidate') {
+      const privateVerdict = record.verdict === 'rejected' || record.verdict === 'superseded';
+      if (!target || target.projectId !== config.projectId || target.kind !== 'rule_candidate'
+        || (target.localOnly && !record.localOnly)
+        || (record.localOnly && !target.localOnly && !privateVerdict)) {
         throw new Error(`Invalid review target: ${record.id}`);
       }
       for (const parentId of [
@@ -450,7 +586,7 @@ export class ProjectMemoryStore {
   /** Lists bounded immutable records and fails closed on malformed persisted data. */
   async listRecords(): Promise<StoredRecord[]> {
     const config = await this.readConfig();
-    const names = (await readdir(this.recordsDirectory)).filter((name) => name.endsWith('.json')).sort();
+    const names = await this.recordNames();
     if (names.length > MAX_RECORDS) throw new Error(`Record limit exceeded: ${names.length}`);
     const invalidName = names.find((name) => !/^[a-f0-9]{64}\.json$/u.test(name));
     if (invalidName) throw new Error(`Invalid record file: ${invalidName}`);
@@ -483,7 +619,7 @@ export class ProjectMemoryStore {
   /** Computes a health summary without silently treating corrupted records as valid context. */
   async status(): Promise<MemoryStatus> {
     const config = await this.readConfig();
-    const names = (await readdir(this.recordsDirectory)).filter((name) => name.endsWith('.json')).sort();
+    const names = await this.recordNames();
     const records: StoredRecord[] = [];
     const corruptedRecords: string[] = [];
     if (names.length > MAX_RECORDS) corruptedRecords.push(`record-limit-exceeded:${names.length}`);
@@ -549,7 +685,9 @@ export function resolveReviewStates(reviews: ReviewRecord[]): {
   const mergeableConflicts = new Set<string>();
   const grouped = new Map<string, ReviewRecord[]>();
   for (const review of reviews) grouped.set(review.targetId, [...(grouped.get(review.targetId) ?? []), review]);
-  for (const [targetId, targetReviews] of grouped) {
+  for (const [targetId, history] of grouped) {
+    const hasSharedApproval = history.some((review) => review.verdict === 'approved' && !review.localOnly);
+    const targetReviews = hasSharedApproval ? history.filter((review) => !review.localOnly) : history;
     const byId = new Map(targetReviews.map((review) => [review.id, review]));
     const parents = (review: ReviewRecord): string[] => [
       ...(review.previousReviewId ? [review.previousReviewId] : []),

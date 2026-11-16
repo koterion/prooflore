@@ -1,9 +1,12 @@
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 
 import { assertNoSecrets, objectValue, stringValue } from './validation.js';
 
+const execFileAsync = promisify(execFile);
 const IDENTITY_SCHEMA_VERSION = 1 as const;
 const IDENTITY_PATH = '.prooflore/local/identity.json';
 const MAX_IDENTITY_BYTES = 4 * 1024;
@@ -17,7 +20,7 @@ export type ProjectMemoryLocalIdentity = {
 export type ProjectMemoryIdentityStatus = {
   configured: boolean;
   developerId?: string;
-  source: 'environment' | 'local' | 'missing';
+  source: 'environment' | 'local' | 'git' | 'missing';
 };
 
 function validatedDeveloperId(value: unknown): string {
@@ -105,7 +108,7 @@ export async function setProjectMemoryIdentity(
 /** Resolves the server-bound developer identity, with environment taking precedence. */
 export async function resolveProjectMemoryIdentity(
   root: string,
-  environmentDeveloperId = process.env.PROJECT_MEMORY_DEVELOPER_ID,
+  environmentDeveloperId = process.env.PROOFLORE_DEVELOPER_ID ?? process.env.PROJECT_MEMORY_DEVELOPER_ID,
 ): Promise<ProjectMemoryIdentityStatus> {
   if (environmentDeveloperId !== undefined && environmentDeveloperId.trim() !== '') {
     return {
@@ -116,5 +119,11 @@ export async function resolveProjectMemoryIdentity(
   }
   const local = await readLocalIdentity(root);
   if (local) return { configured: true, developerId: local.developerId, source: 'local' };
+  const gitName = await execFileAsync('git', ['config', '--local', '--get', 'user.name'], {
+    cwd: resolve(root),
+    timeout: 2000,
+    maxBuffer: MAX_IDENTITY_BYTES,
+  }).then(({ stdout }) => stdout.trim(), () => '');
+  if (gitName) return { configured: true, developerId: validatedDeveloperId(gitName), source: 'git' };
   return { configured: false, source: 'missing' };
 }

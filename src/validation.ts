@@ -112,10 +112,33 @@ export function parseRuleClassification(value: unknown, name = 'classification')
 /** Parses untrusted MCP or CLI input into the portable memory contract. */
 export function parseRecordInput(value: unknown): RecordMemoryInput {
   const input = objectValue(value, 'record');
+  if (input.localOnly !== undefined && typeof input.localOnly !== 'boolean') throw new Error('localOnly must be a boolean');
+  const localOnly = input.localOnly === true ? true : undefined;
   const kind = stringValue(input.kind, 'kind', 32) as MemoryKind;
   if (!MEMORY_KINDS.includes(kind)) throw new Error(`Unsupported memory kind: ${kind}`);
   const summary = stringValue(input.summary, 'summary', 4000);
   const rationale = input.rationale === undefined ? undefined : stringValue(input.rationale, 'rationale', 4000);
+  const assessment = input.ruleAssessment === undefined ? undefined : objectValue(input.ruleAssessment, 'ruleAssessment');
+  const reason = assessment?.reason === undefined ? undefined : stringValue(assessment.reason, 'ruleAssessment.reason', 1000);
+  const candidateIds = stringArray(assessment?.candidateIds, 'ruleAssessment.candidateIds', 20, 64)
+    .map((id, index) => recordIdValue(id, `ruleAssessment.candidateIds[${index}]`));
+  if (assessment && ((reason === undefined) === (candidateIds.length === 0))) {
+    throw new Error('ruleAssessment requires exactly one of reason or nonempty candidateIds');
+  }
+  if (reason) assertNoSecrets(reason, 'ruleAssessment.reason');
+  const disposition = assessment?.disposition;
+  const existingRuleId = assessment?.existingRuleId === undefined ? undefined
+    : recordIdValue(assessment.existingRuleId, 'ruleAssessment.existingRuleId');
+  if (disposition !== undefined && disposition !== 'no_reusable_practice'
+    && disposition !== 'insufficient_evidence' && disposition !== 'existing_rule') {
+    throw new Error('Invalid ruleAssessment.disposition');
+  }
+  if ((disposition !== undefined && !reason) || (disposition === 'existing_rule') !== Boolean(existingRuleId)) {
+    throw new Error('ruleAssessment.existingRuleId is required only for an existing_rule decision');
+  }
+  const ruleAssessment: RecordMemoryInput['ruleAssessment'] = assessment
+    ? reason ? { reason, disposition, existingRuleId } : { candidateIds: [...new Set(candidateIds)].sort() }
+    : undefined;
   const tags = stringArray(input.tags, 'tags', 20, 64).map((tag) => tag.toLocaleLowerCase());
   const scope = stringArray(input.scope, 'scope', 30, 256)
     .map((path, index) => relativeProjectPath(path, `scope[${index}]`));
@@ -142,8 +165,10 @@ export function parseRecordInput(value: unknown): RecordMemoryInput {
 
   return {
     kind,
+    localOnly,
     summary,
     rationale,
+    ruleAssessment,
     tags,
     scope,
     evidence,

@@ -12,6 +12,7 @@ import {
   listRules,
 } from './context.js';
 import { resolveProjectMemoryIdentity, setProjectMemoryIdentity } from './identity.js';
+import { importRules } from './import-rules.js';
 import { runProjectMemoryMcp } from './mcp.js';
 import {
   checkProjectMemorySetup,
@@ -53,7 +54,7 @@ function validateReviewArguments(args: string[]): void {
 }
 
 function usage(): never {
-  throw new Error('Usage: prooflore setup|update|sync [--project ID] [--provider codex|claude|cursor] [--dry-run|--check] [--accept-rule-migration] | init --project ID | identity set DEVELOPER_ID | identity show | doctor | context TASK [--path PATH] | explain-context TASK [--path PATH] [--limit N] | candidates [--cursor ID] [--limit N] | rules [--state STATE] [--area AREA] [--language LANGUAGE] [--test-type TYPE] [--cursor ID] [--limit N] | history ID | record --file JSON | review ID approved|rejected|revoked|superseded --reason TEXT --developer ID [--area A,B|global] [--language L|global] [--test-type T|global] | mcp');
+  throw new Error('Usage: prooflore setup|update|sync [--project ID] [--provider codex|claude|cursor] [--dry-run|--check] [--accept-rule-migration] | init --project ID | identity set DEVELOPER_ID | identity show | doctor | context TASK [--path PATH] | explain-context TASK [--path PATH] [--limit N] | candidates [--cursor ID] [--limit N] | rules [--tag TAG] [--state STATE] [--area AREA] [--language LANGUAGE] [--test-type TYPE] [--cursor ID] [--limit N] | history ID | import FILE.md [--apply] [--local] | record --file JSON | review ID approved|rejected|revoked|superseded --reason TEXT --developer ID [--area A,B|global] [--language L|global] [--test-type T|global] | mcp');
 }
 
 /** Runs the ProofLore administration CLI. */
@@ -126,6 +127,7 @@ export async function runCli(args = process.argv.slice(2), root = process.cwd())
     return listRules(store, {
       state: option(args, '--state') as RuleCandidateState | undefined,
       area: option(args, '--area'),
+      tag: option(args, '--tag'),
       language: option(args, '--language'),
       testType: option(args, '--test-type'),
     }, option(args, '--cursor'), limit);
@@ -142,6 +144,13 @@ export async function runCli(args = process.argv.slice(2), root = process.cwd())
     return explainMemoryContext(store, task, paths, limitValue === undefined ? 100 : Number(limitValue));
   }
   if (command === 'history') return store.ruleHistory(args[1] ?? usage());
+  if (command === 'import') {
+    const file = args[1];
+    const flags = args.slice(2);
+    if (!file || file.startsWith('--') || new Set(flags).size !== flags.length
+      || flags.some((flag) => flag !== '--apply' && flag !== '--local')) usage();
+    return importRules(store, file, flags.includes('--apply'), flags.includes('--local'));
+  }
   if (command === 'record') {
     const file = option(args, '--file') ?? usage();
     return store.record(parseRecordInput(JSON.parse(await readFile(file, 'utf8'))), 'human');

@@ -1,298 +1,124 @@
 # ProofLore
 
-Local, shared memory for coding agents.
+Reviewed project memory for coding agents.
 
-ProofLore gives Codex, Claude Code, Cursor and other MCP clients the same reviewed
-project knowledge. Decisions, corrections and approved rules live in the repository,
-so every developer and agent can work from the same context.
+[![npm](https://img.shields.io/npm/v/prooflore?logo=npm)](https://www.npmjs.com/package/prooflore)
+[![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-- Local-first: no hosted ProofLore service is required.
-- Provider-neutral: one memory store works across supported agents.
-- Reviewable: agents may propose rules, but only a human can approve them.
-- Merge-friendly: knowledge is stored as immutable, content-addressed JSON records.
-- Privacy-aware: prompts, chat transcripts and source files are not collected.
+ProofLore helps your agent reuse team decisions and coding rules across chats. The agent can propose a rule after finishing a task. Once you approve it, future agents can use it when it applies.
 
-## Quick start
+## Try it in your project
 
-Requires Node.js 20 or newer.
+Requires Node.js 20 or later. From your project root, run:
 
 ```sh
-npm install --save-dev prooflore
+npm install -D prooflore
 npx prooflore setup
-npx prooflore identity set YOUR_DEVELOPER_ID
 ```
 
-To preview the planned changes without writing files:
+Open a new chat in Codex, Claude Code, or Cursor.
+
+## See it in Codex
+
+Codex tested a team convention on checkout and profile forms, then reused the
+approved rule for a billing form in a fresh chat. The excerpts below are from a
+demo project with a test approval through the ProofLore form.
+
+```text
+You: Can you add a regression test for the invalid checkout form? Assert the validation message and make sure the save request never fires. We want both checks for invalid submissions on all our forms, including profile.
+
+Codex: Added invalid-submission tests for checkout.test.js and profile.test.js.
+
+Both assert:
+
+- The validation message.
+- The save request never fires.
+
+`npm test`: 4/4 passing.
+
+I also saved this pattern as a pending ProofLore rule. Would you like to review it?
+
+You: Open the approval form for the form validation rule.
+```
+
+In the ProofLore form, choose **Approve → Accept**.
+
+```text
+Codex: The form validation rule was approved through the ProofLore review form.
+```
+
+In a new chat:
+
+```text
+You: Show me the active ProofLore rules.
+```
+
+| Rule | Tags | Programming languages | Test types |
+|---|---|---|---|
+| For every form, invalid-submission regression tests must assert both the returned validation message and that the save request is never invoked. | forms, validation | Any | unit |
+
+```text
+You: Can you add a test for an invalid billing form submission?
+
+Codex: Added invalid submission coverage in billing.test.js.
+
+It verifies:
+
+- The billing validation message is returned.
+- The save request is never invoked.
+
+`npm test`: all 6 tests pass.
+```
+
+<details>
+<summary>Share rules with your team</summary>
+
+Pending rules and rejected decisions stay on the computer that created them. Approval for the team makes a rule available in the shared store. Commit the generated setup files and the shared `.prooflore/records/` directory. Teammates install the project dependencies and open a new agent chat. For a personal rule, choose **Keep only on this computer** in the review form. ProofLore stores the approved version in the Git-ignored `.prooflore/local/` directory.
+
+ProofLore runs locally and stores rule records and short evidence references. It does not upload the store or collect chat transcripts. The connected agent handles translation when displaying rules or saving a localized edit.
+
+</details>
+
+<details>
+<summary>Setup, updates, and troubleshooting</summary>
+
+Preview setup or configure only one client:
 
 ```sh
 npx prooflore setup --dry-run
-```
-
-`setup` configures Codex, Claude Code and Cursor by default. To configure selected
-clients only:
-
-```sh
 npx prooflore setup --provider codex
-npx prooflore setup --provider claude --provider cursor
 ```
 
-Restart any agent sessions that were already open.
+Setup adds project-level MCP configuration and workflow instructions while preserving unrelated content. Codex uses `.codex/config.toml`, Claude Code uses `.mcp.json`, and Cursor uses `.cursor/mcp.json`. Other MCP clients can run `prooflore-mcp` over stdio.
 
-## How it works
+After updating the dependency, run `npx prooflore sync` and open a new agent chat. Teams can opt into a `"postinstall": "prooflore sync"` script. If setup reports a conflict, use `npx prooflore sync --dry-run` to inspect it.
 
-ProofLore creates a project-local store:
+If the agent cannot find ProofLore, run `npx prooflore doctor`. To check reviewer identity, run `npx prooflore identity show`. ProofLore uses the repository-local Git name or a local override set with `npx prooflore identity set YOUR_ID`.
 
-```text
-.prooflore/
-  .gitignore
-  config.json
-  setup.json
-  AGENT_WORKFLOW.md
-  local/
-    identity.json        # ignored, local to this developer
-  records/
-    <sha256>.json
-```
+</details>
 
-Commit the generated configuration and `records/` directory. Each record is immutable,
-so contributions from different developers normally merge as separate files.
-
-Local caches, sessions, traces, transcripts, logs and temporary files are excluded by
-`.prooflore/.gitignore`. ProofLore does not upload the store or open a network port.
-
-Depending on the selected clients, `setup` also creates or updates:
-
-```text
-AGENTS.md            # ProofLore workflow pointer for Codex/Cursor
-CLAUDE.md            # ProofLore workflow pointer for Claude Code
-.codex/config.toml   # Codex MCP configuration
-.mcp.json            # Claude Code MCP configuration
-.cursor/mcp.json     # Cursor MCP configuration
-```
-
-If any of these files already exists, ProofLore preserves unrelated configuration
-and changes only its managed block or MCP entry.
-
-## Supported clients
-
-| Client | Project configuration |
-| --- | --- |
-| Codex | `.codex/config.toml` and an `AGENTS.md` pointer |
-| Claude Code | `.mcp.json` and a `CLAUDE.md` pointer |
-| Cursor | `.cursor/mcp.json` |
-| Other MCP clients | Manual stdio configuration using `prooflore-mcp` |
-
-Existing configuration and instructions outside ProofLore-managed blocks are
-preserved. Setup never changes global agent settings, permissions or approval policy.
-
-## Agent workflow
-
-1. Retrieve relevant memory before planning or editing, using a concise English task
-   description while preserving exact identifiers.
-2. Treat approved rules as project guidance.
-3. Treat historical records as advisory and verify them against the current code.
-4. Record durable decisions, corrections, outcomes and exemplars after verification.
-5. Propose reusable rules for human review.
-
-`project_memory_context` classifies the task from its description and affected paths.
-It automatically selects approved rules whose area, language and test type are
-compatible, prioritizes exact matches and excludes conflicting classified rules.
-Global approved rules without classification remain applicable. The response includes
-`classification` and `ruleMatches` so the selection is inspectable.
-
-An agent proposes both the rule and its classification, but the human reviewer has
-final authority over both. Supported clients show the calculated area, language and
-test type in the review form and allow the reviewer to correct them before approval.
-The confirmed classification is stored in the immutable review and overrides the
-agent proposal. The CLI is available as a fallback:
+<details>
+<summary>Import and manage rules from the terminal</summary>
 
 ```sh
-npx prooflore candidates --limit 20
-npx prooflore review RECORD_ID approved \
-  --reason "Confirmed in code review" \
-  --developer REVIEWER_ID \
-  --area accordion \
-  --language typescript \
-  --test-type unit
+npx prooflore import rules.md
+npx prooflore import rules.md --apply
+npx prooflore candidates
+npx prooflore rules --state approved --language typescript --tag jest --test-type unit
+npx prooflore history RECORD_ID
 ```
 
-Use a comma-separated value for multiple categories, or `global` to clear a facet.
-Omitted classification options retain the calculated values shown for review.
+Import previews a Markdown file with one rule per top-level bullet or numbered item. Add `--local` to keep the imported candidates on this machine. You can also paste existing rules into chat and ask ProofLore to preview an import.
 
-Approved rules can be revoked without deleting their history:
+If your client cannot open the review form, use the CLI:
 
 ```sh
-npx prooflore review RECORD_ID revoked \
-  --reason "No longer valid after the API migration" \
-  --developer REVIEWER_ID
+npx prooflore review RECORD_ID approved --reason "Confirmed in review" --developer YOUR_ID
 ```
 
-The original rule and every review remain immutable, including the reviewer, reason
-and timestamp. A human can restore the same rule later by reviewing it as `approved`
-again. Use `npx prooflore history RECORD_ID` to inspect the complete audit trail.
+Use `revoked` in place of `approved` to retire a rule. Prior versions and decisions remain in history.
 
-Classify proposed rules with namespaced tags so the catalog remains predictable:
+</details>
 
-```text
-area:accordion
-language:typescript
-test:unit
-rule-key:accordion-rendering
-```
-
-`area:`/`domain:`, `language:`/`lang:` and `test:`/`test-type:` are supported.
-Common language and test aliases such as `js`, `ts`, `py`, `unit-test` and
-`end-to-end` are canonicalized. `doctor` reports suspicious unknown taxonomy and
-ambiguous `rule-key:` tags without rewriting immutable records.
-For older rules without these tags, ProofLore derives compatible fallback categories
-only from `scope`. Evidence paths prove a rule but never restrict where it applies,
-so a rule without classification tags or scope remains global. Browse the catalog with:
-
-```sh
-npx prooflore rules
-npx prooflore rules --area accordion --language typescript --test-type unit
-```
-
-Use one stable `rule-key:` for mutually exclusive versions of a policy. A pending
-replacement never disables the approved rule. After human approval, the replacement
-must list every prior version in `supersedes`; unresolved approved rules with the same
-key are excluded fail-closed and visible through `explain-context`.
-
-## MCP tools
-
-| Tool | Purpose |
-| --- | --- |
-| `project_memory_context` | Retrieve bounded context for a task and affected paths |
-| `project_memory_explain_context` | Explain why rules were selected or excluded |
-| `project_memory_get` | Read an immutable record by ID |
-| `project_memory_status` | Check store integrity, contributors and setup state |
-| `project_memory_candidates` | List rules awaiting human review |
-| `project_memory_rules` | Browse rules sorted by area, language and test type |
-| `project_memory_rule_history` | Read a rule's complete human review history |
-| `project_memory_record` | Save a verified observation |
-| `project_memory_propose_rule` | Propose a reusable rule |
-| `project_memory_review_rule` | Request a human-controlled review form |
-
-## Team identity
-
-Configure the identity once for each local checkout:
-
-```sh
-npx prooflore identity set koterion
-npx prooflore identity show
-```
-
-ProofLore stores it in ignored `.prooflore/local/identity.json`. Agents cannot choose
-or override this identity, and agent writes fail closed until it is configured.
-
-Automation and CI may override the local value through the MCP environment:
-
-```text
-PROJECT_MEMORY_DEVELOPER_ID
-PROJECT_MEMORY_PROVIDER
-PROJECT_MEMORY_MODEL
-PROJECT_MEMORY_SESSION_ID
-```
-
-`PROJECT_MEMORY_DEVELOPER_ID` takes precedence over the local value. Provider, model
-and session values are optional runtime provenance. Developer IDs are provenance
-labels, not authentication.
-
-## Updates
-
-Update the dependency, preview the reconciliation, then apply it:
-
-```sh
-npm update prooflore
-npx prooflore update --dry-run
-npx prooflore update
-```
-
-ProofLore updates only content it owns. If a managed block was edited, removed or
-replaced, the update stops without overwriting the project version.
-
-To reconcile setup automatically after dependency installation, add an explicit
-project script:
-
-```json
-{
-  "scripts": {
-    "postinstall": "prooflore sync"
-  }
-}
-```
-
-If the project already has a `postinstall` script, append `prooflore sync` rather
-than replacing the existing command.
-
-## CLI
-
-| Command | Description |
-| --- | --- |
-| `prooflore setup` | Initialize the store and configure supported clients |
-| `prooflore update` | Reconcile an existing installation |
-| `prooflore sync` | Setup/update command suitable for package lifecycle scripts |
-| `prooflore init --project ID` | Initialize only the memory store |
-| `prooflore identity set ID` | Store this checkout's ignored developer identity |
-| `prooflore identity show` | Show the effective developer identity and its source |
-| `prooflore doctor` | Verify records, reviews and managed setup |
-| `prooflore context TASK --path PATH` | Retrieve bounded local context |
-| `prooflore explain-context TASK --path PATH` | Explain rule selection and exclusions |
-| `prooflore candidates` | List rule candidates |
-| `prooflore rules` | Browse and filter the classified rule catalog |
-| `prooflore history ID` | Show approval, revocation and restoration history |
-| `prooflore record --file INPUT.json` | Append a validated record |
-| `prooflore review ID VERDICT ...` | Record a human review |
-| `prooflore mcp` | Start the stdio MCP server |
-
-## Security and privacy
-
-- No runtime network requests or hidden model calls.
-- No raw prompts, chat transcripts or source trees are stored.
-- Likely credentials and private keys are rejected before storage.
-- Paths must remain inside the current project.
-- Stored records are revalidated and their content hashes are checked on read.
-- Invalid, ambiguous or oversized rule classifications are rejected before storage.
-- Reviews with missing targets, invalid parents or modified classifications fail closed.
-- Corrupted, tampered or foreign-project records fail closed.
-- Agents cannot supply human rule-review verdicts.
-- Agent writes use only the server-bound developer identity and fail closed when it is missing.
-- The package does not execute project code or modify global provider configuration.
-
-Normal client approval and project-trust controls still apply.
-
-## Troubleshooting
-
-### The agent does not see ProofLore tools
-
-Run `npx prooflore doctor`, confirm the client-specific configuration exists, then
-restart the agent session.
-
-### Agent writes report that developer identity is not configured
-
-Run `npx prooflore identity set YOUR_DEVELOPER_ID`, verify it with
-`npx prooflore identity show`, then restart the agent session.
-
-### Setup or `postinstall` stops
-
-ProofLore detected stale or edited managed content. Inspect the proposed changes:
-
-```sh
-npm install --ignore-scripts
-npx prooflore sync --dry-run
-npx prooflore sync
-```
-
-### A proposed rule is not applied
-
-Rules remain advisory until a human approves them. Run `npx prooflore candidates`
-and review the candidate in chat or through the CLI.
-
-### `doctor` reports a review conflict
-
-Two valid human verdict branches exist. Neither becomes authoritative automatically;
-a human must submit a later review that joins the branches.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+[MIT License](LICENSE)

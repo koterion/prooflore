@@ -1,3 +1,4 @@
+import { PENDING_MERGE_TAG } from './types.js';
 import type {
   MemoryContext,
   MemoryContextExplanation,
@@ -14,6 +15,7 @@ import {
   KNOWN_RULE_LANGUAGES,
   KNOWN_RULE_TEST_TYPES,
   normalizeRuleFacet,
+  stringValue,
 } from './validation.js';
 
 function terms(value: string): Set<string> {
@@ -21,18 +23,17 @@ function terms(value: string): Set<string> {
     .filter((term) => term.length >= 2));
 }
 
-function relevance(record: MemoryRecord, queryTerms: Set<string>, paths: string[]): number {
+function relevance(record: MemoryRecord, queryTerms: Set<string>, paths: string[], reviewTags?: string[]): number {
   const summary = terms(`${record.summary} ${record.rationale ?? ''}`);
-  const tagHits = record.tags.filter((tag) => queryTerms.has(tag.toLocaleLowerCase())).length;
+  const tags = reviewTags === undefined ? record.tags
+    : [...record.tags.filter((tag) => tag.includes(':')), ...reviewTags];
+  const tagHits = [...new Set(tags.map((tag) => tag.toLocaleLowerCase()))]
+    .filter((tag) => queryTerms.has(tag)).length;
   const textHits = [...queryTerms].filter((term) => summary.has(term)).length;
   const scopedPaths = [...record.scope, ...record.evidence.flatMap((entry) => entry.path ? [entry.path] : [])];
   const pathHits = scopedPaths.filter((scope) => paths.some((path) => path === scope
     || path.startsWith(`${scope}/`) || scope.startsWith(`${path}/`))).length;
   return (tagHits * 5) + (pathHits * 4) + (textHits * 2);
-}
-
-function serializedCharacters(records: MemoryRecord[]): number {
-  return records.reduce((total, record) => total + JSON.stringify(record).length, 0);
 }
 
 const LANGUAGE_EXTENSIONS: Readonly<Record<string, string>> = {
@@ -158,6 +159,8 @@ export function classifyTask(query: string, paths: string[], knownAreas: string[
   };
 }
 
+export const LANGUAGE_TEST_RULE_TAG = 'applicability:language-and-test';
+
 /** Derives rule applicability from explicit tags and scope; evidence never narrows applicability. */
 export function classifyRule(record: MemoryRecord): RuleClassification {
   const explicitAreas = taggedFacets(record.tags, ['area:', 'domain:']);
@@ -165,7 +168,8 @@ export function classifyRule(record: MemoryRecord): RuleClassification {
   const explicitLanguages = taggedFacets(record.tags, ['language:', 'lang:'], 'languages');
   const explicitTestTypes = taggedFacets(record.tags, ['test-type:', 'test:'], 'testTypes');
   return {
-    areas: explicitAreas.length > 0 ? explicitAreas : inferred.areas,
+    areas: record.tags.includes(LANGUAGE_TEST_RULE_TAG) ? []
+      : explicitAreas.length > 0 ? explicitAreas : inferred.areas,
     languages: explicitLanguages.length > 0
       ? explicitLanguages
       : inferred.languages,
@@ -175,17 +179,35 @@ export function classifyRule(record: MemoryRecord): RuleClassification {
   };
 }
 
+/** Prefills a language only when the rule text names a tagged language. */
+export function classifyRuleForReview(record: MemoryRecord): RuleClassification {
+  const classification = classifyRule(record);
+  const taggedLanguages = taggedFacets(record.tags, ['language:', 'lang:'], 'languages');
+  const words = new Set(record.summary.toLocaleLowerCase().match(/[a-z0-9][a-z0-9-]*/gu) ?? []);
+  return {
+    ...classification,
+    areas: [],
+    languages: taggedLanguages.filter((language) => words.has(language)),
+  };
+}
+
 function facetMatches(ruleValues: string[], taskValues: string[], automatedWildcard = false): string[] {
   if (automatedWildcard && taskValues.includes('automated')) return ruleValues;
   if (automatedWildcard && ruleValues.includes('automated')) return taskValues;
   return ruleValues.filter((value) => taskValues.includes(value));
 }
 
+/** Treats Maestro as a tool qualifier when the rule also names a feature area. */
+function applicableAreas(ruleAreas: string[], taskAreas: string[]): string[] {
+  const featureAreas = ruleAreas.filter(area => area !== 'maestro');
+  return facetMatches(featureAreas.length > 0 ? featureAreas : ruleAreas, taskAreas);
+}
+
 function ruleMatch(
   rule: RuleClassification,
   task: RuleClassification,
 ): { compatible: boolean; areas: string[]; languages: string[]; testTypes: string[] } {
-  const areas = facetMatches(rule.areas, task.areas);
+  const areas = applicableAreas(rule.areas, task.areas);
   const languages = facetMatches(rule.languages, task.languages);
   const testTypes = facetMatches(rule.testTypes, task.testTypes, true);
   const compatible = (rule.areas.length === 0 || task.areas.length === 0 || areas.length > 0)
@@ -198,9 +220,11 @@ function ruleKey(record: MemoryRecord): string | undefined {
   return taggedFacets(record.tags, ['rule-key:'])[0];
 }
 
-function supersededRecordIds(
+/** Resolves retired records and immutable revisions of unreviewed drafts. */
+export function supersededRecordIds(
   memory: MemoryRecord[],
   reviews: Map<string, ReviewRecord>,
+  conflicts?: ReadonlyMap<string, unknown>,
 ): Set<string> {
   const byId = new Map(memory.map((record) => [record.id, record]));
   const superseded = new Set<string>();
@@ -208,7 +232,10 @@ function supersededRecordIds(
     for (const targetId of record.supersedes) {
       const target = byId.get(targetId);
       if (!target) continue;
-      if (target.kind !== 'rule_candidate'
+      const mergedDraft = record.kind === 'rule_candidate'
+        && record.supersedes.length === 1 && record.tags.includes(PENDING_MERGE_TAG)
+        && !reviews.has(targetId) && !conflicts?.has(targetId);
+      if (mergedDraft || target.kind !== 'rule_candidate'
         || (record.kind === 'rule_candidate' && reviews.get(record.id)?.verdict === 'approved')) {
         superseded.add(targetId);
       }
@@ -221,12 +248,14 @@ function supersededRecordIds(
 function candidateSummary(
   record: MemoryRecord,
   reviewState: ReturnType<typeof resolveReviewStates>,
+  superseded: ReadonlySet<string>,
 ): RuleCandidatePage['items'][number] {
   const review = reviewState.latest.get(record.id);
   const state: RuleCandidateState = reviewState.conflicts.has(record.id)
-    ? 'conflict' : review?.verdict ?? 'pending';
+    ? 'conflict' : superseded.has(record.id) ? 'superseded' : review?.verdict ?? 'pending';
   return {
     id: record.id,
+    localOnly: record.localOnly,
     summary: record.summary,
     scope: record.scope,
     evidenceCount: record.evidence.length,
@@ -234,6 +263,8 @@ function candidateSummary(
     createdAt: record.createdAt,
     state,
     latestReviewId: review?.id,
+    supersedes: record.supersedes.length ? record.supersedes : undefined,
+    tags: review?.tags ?? record.tags.filter((tag) => !tag.includes(':')),
     latestReview: review ? {
       verdict: review.verdict,
       reason: review.reason,
@@ -241,6 +272,22 @@ function candidateSummary(
       createdAt: review.createdAt,
     } : undefined,
     classification: review?.classification ?? classifyRule(record),
+  };
+}
+
+/** Collects known review facets from active rules and pending candidates. */
+export async function listReviewFacets(store: ProjectMemoryStore): Promise<Pick<RuleClassification, 'languages' | 'testTypes'>> {
+  const records = await store.listRecords();
+  const candidates = records.filter((record): record is MemoryRecord => record.kind === 'rule_candidate');
+  const reviewState = resolveReviewStates(records.filter((record): record is ReviewRecord => record.kind === 'review'));
+  const superseded = supersededRecordIds(candidates, reviewState.latest, reviewState.conflicts);
+  const classifications = candidates
+    .map((candidate) => candidateSummary(candidate, reviewState, superseded))
+    .filter((candidate) => candidate.state === 'approved' || candidate.state === 'pending')
+    .map((candidate) => candidate.classification);
+  return {
+    languages: [...new Set(classifications.flatMap((classification) => classification.languages))].sort(),
+    testTypes: [...new Set(classifications.flatMap((classification) => classification.testTypes))].sort(),
   };
 }
 
@@ -259,6 +306,9 @@ export async function buildMemoryContext(
   const reviews = reviewState.latest;
   const superseded = supersededRecordIds(memory, reviews);
   const queryTerms = terms(query);
+  for (const packageName of query.toLocaleLowerCase().match(/@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*/gu) ?? []) {
+    queryTerms.add(packageName.replace(/\.+$/u, ''));
+  }
   const ruleClassifications = new Map(memory
     .filter((record) => record.kind === 'rule_candidate')
     .map((record) => [record.id, reviews.get(record.id)?.classification ?? classifyRule(record)]));
@@ -271,7 +321,7 @@ export async function buildMemoryContext(
         ? ruleMatch(ruleClassifications.get(record.id)!, classification) : undefined;
       const applicableRule = record.kind === 'rule_candidate'
         && reviews.get(record.id)?.verdict === 'approved' && match?.compatible === true;
-      const score = relevance(record, queryTerms, paths)
+      const score = relevance(record, queryTerms, paths, reviews.get(record.id)?.tags)
         + ((match?.areas.length ?? 0) * 12)
         + ((match?.languages.length ?? 0) * 8)
         + ((match?.testTypes.length ?? 0) * 10);
@@ -300,13 +350,21 @@ export async function buildMemoryContext(
   const selectedRules: MemoryRecord[] = [];
   const selectedHistory: MemoryRecord[] = [];
   let truncated = false;
+  let usedCharacters = 0;
+  let ruleCharacters = 0;
+  const omittedRuleIds: string[] = [];
+  const entryLimit = Math.min(Math.max(limit, 1), 30);
   for (const record of [...approvedRules, ...history]) {
     const target = record.kind === 'rule_candidate' ? selectedRules : selectedHistory;
-    if (selectedRules.length + selectedHistory.length >= Math.min(Math.max(limit, 1), 30)
-      || serializedCharacters([...selectedRules, ...selectedHistory, record]) > config.maxContextCharacters) {
+    const characters = JSON.stringify(record).length;
+    if (selectedRules.length + selectedHistory.length >= entryLimit
+      || usedCharacters + characters > config.maxContextCharacters) {
       truncated = true;
+      if (target === selectedRules && omittedRuleIds.length < 12) omittedRuleIds.push(record.id);
       continue;
     }
+    usedCharacters += characters;
+    if (target === selectedRules) ruleCharacters += characters;
     target.push(record);
   }
   const conflicts = memory
@@ -316,13 +374,21 @@ export async function buildMemoryContext(
   for (const [recordId, key] of ruleKeyConflicts) {
     conflicts.push({ recordId, reason: `rule-key-conflict:${key}` });
   }
+  const active = memory.filter((record) => record.kind === 'rule_candidate'
+    && reviews.get(record.id)?.verdict === 'approved' && !superseded.has(record.id)).length;
+  const omitted = approvedRules.length - selectedRules.length;
+  const ruleBudget = active >= 50 || omitted > 0 || ruleCharacters >= config.maxContextCharacters * 0.8
+    ? { active, applicable: approvedRules.length, omitted, omittedRuleIds, characterLimit: config.maxContextCharacters }
+    : undefined;
+  const matches = new Map(applicableEntries.map(({ record, match }) => [record.id, match]));
   return {
     projectId: config.projectId,
     query,
+    ...(ruleBudget ? { ruleBudget } : {}),
     classification,
     approvedRules: selectedRules,
     ruleMatches: selectedRules.map((record) => {
-      const match = ranked.find((entry) => entry.record.id === record.id)?.match;
+      const match = matches.get(record.id);
       return {
         recordId: record.id,
         areas: match?.areas ?? [],
@@ -338,7 +404,7 @@ export async function buildMemoryContext(
 
 function incompatibilityReason(rule: RuleClassification, task: RuleClassification): string | undefined {
   if (rule.areas.length > 0 && task.areas.length > 0
-    && facetMatches(rule.areas, task.areas).length === 0) return 'area-mismatch';
+    && applicableAreas(rule.areas, task.areas).length === 0) return 'area-mismatch';
   if (rule.languages.length > 0 && task.languages.length > 0
     && facetMatches(rule.languages, task.languages).length === 0) return 'language-mismatch';
   if (rule.testTypes.length > 0 && task.testTypes.length === 0) return 'test-rule-for-non-test-task';
@@ -360,7 +426,7 @@ export async function explainMemoryContext(
   const memory = records.filter((record): record is MemoryRecord => record.kind !== 'review');
   const reviewState = resolveReviewStates(records
     .filter((record): record is ReviewRecord => record.kind === 'review'));
-  const superseded = supersededRecordIds(memory, reviewState.latest);
+  const superseded = supersededRecordIds(memory, reviewState.latest, reviewState.conflicts);
   const selected = new Set(context.approvedRules.map((record) => record.id));
   const conflicts = new Map(context.conflicts.map((conflict) => [conflict.recordId, conflict.reason]));
   const decisions = memory
@@ -398,15 +464,17 @@ export async function listRuleCandidates(
 ): Promise<RuleCandidatePage> {
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('limit must be an integer from 1 to 50');
   const records = await store.listRecords();
+  const memory = records.filter((record): record is MemoryRecord => record.kind !== 'review');
   const reviewState = resolveReviewStates(records
     .filter((record): record is ReviewRecord => record.kind === 'review'));
+  const superseded = supersededRecordIds(memory, reviewState.latest, reviewState.conflicts);
   const candidates = records
     .filter((record): record is MemoryRecord => record.kind === 'rule_candidate')
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id));
   const start = cursor ? candidates.findIndex((record) => record.id === cursor) + 1 : 0;
   if (cursor && start === 0) throw new Error('Unknown candidate cursor');
   const page = candidates.slice(start, start + limit);
-  const items = page.map((record) => candidateSummary(record, reviewState));
+  const items = page.map((record) => candidateSummary(record, reviewState, superseded));
   return {
     items,
     nextCursor: start + limit < candidates.length ? page.at(-1)?.id : undefined,
@@ -467,6 +535,7 @@ export async function listRules(
     .includes(filters.state)) throw new Error('Invalid rule state filter');
   const normalizedFilters: RuleCatalogFilters = {
     state: filters.state,
+    ...(filters.tag === undefined ? {} : { tag: stringValue(filters.tag, 'tag', 64).toLowerCase() }),
     area: normalizedClassificationFilter('areas', filters.area),
     language: normalizedClassificationFilter('languages', filters.language),
     testType: normalizedClassificationFilter('testTypes', filters.testType),
@@ -475,12 +544,16 @@ export async function listRules(
   if (filters.language && !normalizedFilters.language) throw new Error('Invalid language filter');
   if (filters.testType && !normalizedFilters.testType) throw new Error('Invalid testType filter');
   const records = await store.listRecords();
+  const memory = records.filter((record): record is MemoryRecord => record.kind !== 'review');
   const reviewState = resolveReviewStates(records
     .filter((record): record is ReviewRecord => record.kind === 'review'));
+  const superseded = supersededRecordIds(memory, reviewState.latest, reviewState.conflicts);
   const items = records
     .filter((record): record is MemoryRecord => record.kind === 'rule_candidate')
-    .map((record) => candidateSummary(record, reviewState))
+    .map((record) => candidateSummary(record, reviewState, superseded))
     .filter((item) => !normalizedFilters.state || item.state === normalizedFilters.state)
+    .filter((item) => !normalizedFilters.tag
+      || item.tags?.some((tag) => tag.toLowerCase() === normalizedFilters.tag))
     .filter((item) => !normalizedFilters.area || item.classification.areas.includes(normalizedFilters.area))
     .filter((item) => !normalizedFilters.language
       || item.classification.languages.includes(normalizedFilters.language))

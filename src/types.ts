@@ -1,3 +1,5 @@
+export const PENDING_MERGE_TAG = 'prooflore:pending-merge';
+
 export const PROJECT_MEMORY_SCHEMA_VERSION = 1 as const;
 
 export const MEMORY_KINDS = [
@@ -33,13 +35,19 @@ export type MemoryActor = {
   sessionId?: string;
 };
 
+export type RuleAssessment =
+  | { candidateIds: string[] }
+  | { reason: string; disposition?: 'no_reusable_practice' | 'insufficient_evidence' | 'existing_rule'; existingRuleId?: string };
+
 export type MemoryRecord = {
+  localOnly?: true;
   schemaVersion: typeof PROJECT_MEMORY_SCHEMA_VERSION;
   id: string;
   projectId: string;
   kind: MemoryKind;
   summary: string;
   rationale?: string;
+  ruleAssessment?: RuleAssessment;
   tags: string[];
   scope: string[];
   evidence: MemoryEvidence[];
@@ -49,6 +57,7 @@ export type MemoryRecord = {
 };
 
 export type ReviewRecord = {
+  localOnly?: true;
   schemaVersion: typeof PROJECT_MEMORY_SCHEMA_VERSION;
   id: string;
   projectId: string;
@@ -59,6 +68,7 @@ export type ReviewRecord = {
   verdict: ReviewVerdict;
   reason: string;
   classification?: RuleClassification;
+  tags?: string[];
   actor: MemoryActor & { kind: 'human' };
   createdAt: string;
 };
@@ -66,9 +76,11 @@ export type ReviewRecord = {
 export type StoredRecord = MemoryRecord | ReviewRecord;
 
 export type RecordMemoryInput = {
+  localOnly?: true;
   kind: MemoryKind;
   summary: string;
   rationale?: string;
+  ruleAssessment?: RuleAssessment;
   tags?: string[];
   scope?: string[];
   evidence?: MemoryEvidence[];
@@ -84,6 +96,13 @@ export type MemoryContext = {
   query: string;
   classification: RuleClassification;
   approvedRules: MemoryRecord[];
+  ruleBudget?: {
+    active: number;
+    applicable: number;
+    omitted: number;
+    omittedRuleIds: string[];
+    characterLimit: number;
+  };
   ruleMatches: Array<{
     recordId: string;
     areas: string[];
@@ -137,7 +156,9 @@ export type RuleClassification = {
 };
 
 export type RuleCandidateSummary = {
+  localOnly?: true;
   id: string;
+  tags?: string[];
   summary: string;
   scope: string[];
   evidenceCount: number;
@@ -145,6 +166,7 @@ export type RuleCandidateSummary = {
   createdAt: string;
   state: RuleCandidateState;
   latestReviewId?: string;
+  supersedes?: string[];
   latestReview?: {
     verdict: ReviewVerdict;
     reason: string;
@@ -160,6 +182,7 @@ export type RuleCandidatePage = {
 };
 
 export type RuleCatalogFilters = {
+  tag?: string;
   state?: RuleCandidateState;
   area?: string;
   language?: string;
