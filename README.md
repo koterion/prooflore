@@ -6,7 +6,7 @@ Reviewed project memory for coding agents.
 [![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-ProofLore helps your agent reuse team decisions and coding rules across chats. The agent can propose a rule after finishing a task. Once you approve it, future agents can use it when it applies.
+ProofLore helps coding agents reuse approved project rules across chats. Agents can propose reusable rules backed by evidence. You decide what becomes active and what to share with your team.
 
 ## Try it in your project
 
@@ -17,66 +17,20 @@ npm install -D prooflore
 npx prooflore setup
 ```
 
-Open a new chat in Codex, Claude Code, or Cursor.
+Open a new chat in Codex, Claude Code, or Cursor. Use an MCP client that supports review forms to approve or edit rules in chat. The CLI also supports review.
 
-## See it in Codex
-
-Codex tested a team convention on checkout and profile forms, then reused the
-approved rule for a billing form in a fresh chat. The excerpts below are from a
-demo project with a test approval through the ProofLore form.
-
-```text
-You: Can you add a regression test for the invalid checkout form? Assert the validation message and make sure the save request never fires. We want both checks for invalid submissions on all our forms, including profile.
-
-Codex: Added invalid-submission tests for checkout.test.js and profile.test.js.
-
-Both assert:
-
-- The validation message.
-- The save request never fires.
-
-`npm test`: 4/4 passing.
-
-I also saved this pattern as a pending ProofLore rule. Would you like to review it?
-
-You: Open the approval form for the form validation rule.
-```
-
-In the ProofLore form, choose **Approve → Accept**.
-
-```text
-Codex: The form validation rule was approved through the ProofLore review form.
-```
-
-In a new chat:
-
-```text
-You: Show me the active ProofLore rules.
-```
-
-| Rule | Tags | Programming languages | Test types |
-|---|---|---|---|
-| For every form, invalid-submission regression tests must assert both the returned validation message and that the save request is never invoked. | forms, validation | Any | unit |
-
-```text
-You: Can you add a test for an invalid billing form submission?
-
-Codex: Added invalid submission coverage in billing.test.js.
-
-It verifies:
-
-- The billing validation message is returned.
-- The save request is never invoked.
-
-`npm test`: all 6 tests pass.
-```
+Ask for the project rules to see the active catalog. You can filter by language, tag, or test type. The agent can display the rules in your chat language or show the stored wording on request.
 
 <details>
 <summary>Share rules with your team</summary>
 
-Pending rules and rejected decisions stay on the computer that created them. Approval for the team makes a rule available in the shared store. Commit the generated setup files and the shared `.prooflore/records/` directory. Teammates install the project dependencies and open a new agent chat. For a personal rule, choose **Keep only on this computer** in the review form. ProofLore stores the approved version in the Git-ignored `.prooflore/local/` directory.
+ProofLore keeps pending rules and rejected reviews in the Git-ignored `.prooflore/local/` directory. Approving a rule for the team makes it shareable through Git. To keep an approved rule personal, choose **Keep only on this computer** in the review form.
 
-ProofLore runs locally and stores rule records and short evidence references. It does not upload the store or collect chat transcripts. The connected agent handles translation when displaying rules or saving a localized edit.
+Review or edit a proposed rule in the chat language. The agent saves approved edits in English, and ProofLore keeps earlier versions and review decisions in history. Follow-up evidence can refine a pending draft. Changes to approved rules go through review.
+
+To share team rules, commit the generated setup files and the shared `.prooflore/records/` files you intend to share. Teammates install the project dependencies and open a new agent chat. Older records already in the shared directory stay there after upgrade.
+
+ProofLore stores memory and evidence references on disk. The connected coding agent handles chat, translation, and review.
 
 </details>
 
@@ -94,6 +48,13 @@ Setup adds project-level MCP configuration and workflow instructions while prese
 
 After updating the dependency, run `npx prooflore sync` and open a new agent chat. Teams can opt into a `"postinstall": "prooflore sync"` script. If setup reports a conflict, use `npx prooflore sync --dry-run` to inspect it.
 
+When upgrading from the older generated workflow, preview the migration and confirm it if the proposed changes look right.
+
+```sh
+npx prooflore sync --accept-rule-migration --dry-run
+npx prooflore sync --accept-rule-migration
+```
+
 If the agent cannot find ProofLore, run `npx prooflore doctor`. To check reviewer identity, run `npx prooflore identity show`. ProofLore uses the repository-local Git name or a local override set with `npx prooflore identity set YOUR_ID`.
 
 </details>
@@ -109,7 +70,7 @@ npx prooflore rules --state approved --language typescript --tag jest --test-typ
 npx prooflore history RECORD_ID
 ```
 
-Import previews a Markdown file with one rule per top-level bullet or numbered item. Add `--local` to keep the imported candidates on this machine. You can also paste existing rules into chat and ask ProofLore to preview an import.
+Import previews a Markdown file with one rule per top-level bullet or numbered item. Imported rules start as local pending candidates. Use `--local` when the imported rules should remain personal after approval. You can also paste existing rules into chat and ask ProofLore to preview an import.
 
 If your client cannot open the review form, use the CLI:
 
